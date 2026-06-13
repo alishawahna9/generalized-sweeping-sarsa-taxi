@@ -84,18 +84,17 @@ class GeneralizedSweepingSARSAAgent:
         
         # 2. מנגנון ההכללה (Kernel) - חלחול ידע למצבים דומים מסביב
         if self.use_kernel:
-            # אופטימיזציה: רצים רק על מצבים שחולקים את אותו סטטוס נוסע ויעד
             r_curr, c_curr, p_curr, d_curr = self.decode_state(state)
-            
-            # לולאה חכמה שעוברת רק על 25 מצבי המיקום האפשריים של המונית עבור אותו תת-משימה
-            for s_hat in range(self.num_states):
-                if s_hat == state:
-                    continue
-                r_h, c_h, p_h, d_h = self.decode_state(s_hat)
-                if p_h == p_curr and d_h == d_curr:
-                    k_val = self._compute_kernel(state, s_hat)
+            # קידוד: state = row*100 + col*20 + passenger*4 + destination
+            # ריצה ישירה על 25 המצבים הרלוונטיים בלבד - ללא סריקת 500 מצבים
+            for r_h in range(5):
+                for c_h in range(5):
+                    s_hat = r_h * 100 + c_h * 20 + p_curr * 4 + d_curr
+                    if s_hat == state:
+                        continue
+                    manhattan_dist = abs(r_curr - r_h) + abs(c_curr - c_h)
+                    k_val = 1.0 / (1.0 + np.exp(self.beta * (manhattan_dist - self.c)))
                     if k_val > 1e-4:
-                        # עדכון המצב הדומה לפי עוצמת הגרעין
                         self.q_table[s_hat, action] += self.alpha * k_val * td_error
         
         # 3. מנגנון תכנון (Prioritized Sweeping)
@@ -114,29 +113,45 @@ class GeneralizedSweepingSARSAAgent:
         return td_error
 
     def _run_planning(self):
-        """לולאת תכנון מבוססת תור עדיפויות בסגנון SARSA"""
+        """לולאת תכנון מבוססת תור עדיפויות - ערך מקסימלי (דטרמיניסטי) במקום epsilon-greedy"""
         steps = 0
         while self.priority_queue and steps < self.planning_steps:
             _, s, a = heapq.heappop(self.priority_queue)
+            if (s, a) not in self.model:
+                continue
             r, s_next, d = self.model[(s, a)]
-            
-            a_next = self.choose_action(s_next)
+
+            # תיקון 1: שימוש ב-max Q ולא ב-choose_action - מונע רעש אקראי בתכנון
             q_curr_plan = self.q_table[s, a]
-            q_next_plan = 0 if d else self.q_table[s_next, a_next]
+            q_next_plan = 0 if d else np.max(self.q_table[s_next])
             td_error_plan = r + self.gamma * q_next_plan - q_curr_plan
-            
+
             self.q_table[s, a] += self.alpha * td_error_plan
-            
+
+            # תיקון 3: הכנסת שכנים מהגרעין לתור - עקביות בין Planning ל-Kernel
+            if self.use_kernel and abs(td_error_plan) > self.theta:
+                r_s, c_s, p_s, d_s = self.decode_state(s)
+                for r_h in range(5):
+                    for c_h in range(5):
+                        s_hat = r_h * 100 + c_h * 20 + p_s * 4 + d_s
+                        if s_hat == s:
+                            continue
+                        manhattan_dist = abs(r_s - r_h) + abs(c_s - c_h)
+                        k_val = 1.0 / (1.0 + np.exp(self.beta * (manhattan_dist - self.c)))
+                        kernel_priority = k_val * abs(td_error_plan)
+                        if kernel_priority > self.theta:
+                            heapq.heappush(self.priority_queue, (-kernel_priority, s_hat, a))
+
             if s in self.predecessors:
                 for (s_pred, a_pred) in self.predecessors[s]:
                     r_pred, _, d_pred = self.model[(s_pred, a_pred)]
-                    a_next_pred = self.choose_action(s)
                     q_curr_pred = self.q_table[s_pred, a_pred]
-                    q_next_pred = 0 if d_pred else self.q_table[s, a_next_pred]
-                    
+                    # תיקון 1: שימוש ב-max Q גם עבור הקודמים
+                    q_next_pred = 0 if d_pred else np.max(self.q_table[s])
+
                     td_error_pred = r_pred + self.gamma * q_next_pred - q_curr_pred
                     priority_pred = abs(td_error_pred)
-                    
+
                     if priority_pred > self.theta:
                         heapq.heappush(self.priority_queue, (-priority_pred, s_pred, a_pred))
             steps += 1
