@@ -68,8 +68,112 @@ def get_designed_reward(env_reward, state, agent, action, reward_type="base"):
         
     return env_reward
 
+def run_ablation_experiment(num_episodes=1000, seed=1):
+    """מריץ מחקר אבלציה על 4 קומבינציות ואוסף 3 מטריקות שונות"""
+    configurations = {
+        "1. Pure SARSA":          {"planning": False, "kernel": False},
+        "2. SARSA + Planning":    {"planning": True,  "kernel": False},
+        "3. SARSA + Kernel":      {"planning": False, "kernel": True},
+        "4. Full Framework":      {"planning": True,  "kernel": True}
+    }
+    
+    ablation_master_data = []
+    print("\n========================================================")
+    print(f"🧬 מתחיל מחקר אבלציה (Ablation Study) - סיד {seed}")
+    print("========================================================")
+
+    for config_name, flags in configurations.items():
+        print(f">>> מריץ קומבינציה: {config_name}...")
+        env = gym.make("Taxi-v4", is_rainy=False)
+        
+        agent = GeneralizedSweepingSARSAAgent(
+            alpha=0.1, gamma=0.95, epsilon=0.1,
+            use_planning=flags["planning"], planning_steps=10, 
+            use_kernel=flags["kernel"], beta=4.0, c=0.5
+        )
+
+        for episode in range(num_episodes):
+            state, info = env.reset(seed=seed * 100 + episode)
+            action = agent.choose_action(state)
+            done = False
+            
+            total_env_reward = 0
+            illegal_actions_count = 0
+            td_errors_in_episode = []
+
+            while not done:
+                next_state, env_reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+
+                custom_reward = get_designed_reward(env_reward, state, agent, action, reward_type="base")
+
+                if env_reward == -10:
+                    illegal_actions_count += 1
+
+                next_action = agent.choose_action(next_state)
+                td_error = agent.update(state, action, custom_reward, next_state, next_action, done)
+                td_errors_in_episode.append(abs(td_error))
+
+                state = next_state
+                action = next_action
+                total_env_reward += env_reward
+
+            mean_td_error = np.mean(td_errors_in_episode) if td_errors_in_episode else 0.0
+
+            ablation_master_data.append({
+                "Episode": episode + 1,
+                "Config_Name": config_name,
+                "Original_Reward": total_env_reward,
+                "Illegal_Actions": illegal_actions_count,
+                "Mean_Absolute_TD_Error": mean_td_error
+            })
+            
+        env.close()
+        print(f"  - קומבינציה זו הסתיימה בהצלחה.")
+
+    return pd.DataFrame(ablation_master_data)
+
+def plot_ablation_metrics(df_ablation):
+    """מייצר גרף משולש (3 מטריקות) עבור מחקר האבלציה"""
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    sns.set_theme(style="darkgrid")
+    
+    df_smoothed = df_ablation.copy()
+    
+    # 🔥 התיקון: המרת סוגי הנתונים ל-float מראש כדי למנוע את שגיאת ה-LossySetitemError
+    df_smoothed["Original_Reward"] = df_smoothed["Original_Reward"].astype(float)
+    df_smoothed["Illegal_Actions"] = df_smoothed["Illegal_Actions"].astype(float)
+    df_smoothed["Mean_Absolute_TD_Error"] = df_smoothed["Mean_Absolute_TD_Error"].astype(float)
+
+    for config in df_smoothed["Config_Name"].unique():
+        mask = df_smoothed["Config_Name"] == config
+        df_smoothed.loc[mask, "Original_Reward"] = df_smoothed.loc[mask, "Original_Reward"].rolling(window=25, min_periods=1).mean()
+        df_smoothed.loc[mask, "Illegal_Actions"] = df_smoothed.loc[mask, "Illegal_Actions"].rolling(window=25, min_periods=1).mean()
+        df_smoothed.loc[mask, "Mean_Absolute_TD_Error"] = df_smoothed.loc[mask, "Mean_Absolute_TD_Error"].rolling(window=25, min_periods=1).mean()
+
+    # ציור מטריקה 1
+    sns.lineplot(data=df_smoothed, x="Episode", y="Original_Reward", hue="Config_Name", ax=axes[0], linewidth=2)
+    axes[0].set_title("1. Cumulative Original Reward", fontsize=12, fontweight='bold')
+    axes[0].set_ylabel("Total Reward (Smoothed)")
+    
+    # ציור מטריקה 2
+    sns.lineplot(data=df_smoothed, x="Episode", y="Illegal_Actions", hue="Config_Name", ax=axes[1], linewidth=2)
+    axes[1].set_title("2. Number of Illegal Actions", fontsize=12, fontweight='bold')
+    axes[1].set_ylabel("Illegal Actions Per Episode")
+    
+    # ציור מטריקה 3
+    sns.lineplot(data=df_smoothed, x="Episode", y="Mean_Absolute_TD_Error", hue="Config_Name", ax=axes[2], linewidth=2)
+    axes[2].set_title("3. Mean Absolute TD Error", fontsize=12, fontweight='bold')
+    axes[2].set_ylabel("Absolute TD Error")
+
+    plt.suptitle("Ablation Study Deep Dive: Analysis of 3 Complementary Metrics", fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig("ablation_study_3_metrics.png", dpi=300, bbox_inches='tight')
+    print("\n[+] הגרף המשולש של האבלציה נשמר בהצלחה: ablation_study_3_metrics.png")
+    plt.show()
+
 def run_reward_experiment(reward_type, num_episodes=1000, seeds=[1]):
-    """מריץ את המודל המלא על פני סידים עבור מערכת פרס ספציפית ומודד את הציון המקורי"""
+    """מריץ את המודל המלא על פני סידים עבור מערכת פרס ספציפית"""
     all_runs_rewards = []
     best_agent = None
     best_score = -np.inf
@@ -93,7 +197,6 @@ def run_reward_experiment(reward_type, num_episodes=1000, seeds=[1]):
                 next_state, env_reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
-                # תיקון: העברת פרמטר הפעולה (action) לפונקציה
                 custom_reward = get_designed_reward(env_reward, state, agent, action, reward_type=reward_type)
 
                 next_action = agent.choose_action(next_state)
@@ -101,7 +204,7 @@ def run_reward_experiment(reward_type, num_episodes=1000, seeds=[1]):
 
                 state = next_state
                 action = next_action
-                total_env_reward += env_reward # תמיד עוקבים אחרי הפרס המקורי להשוואה הוגנת
+                total_env_reward += env_reward
 
             rewards_per_episode.append(total_env_reward)
 
@@ -117,13 +220,17 @@ def run_reward_experiment(reward_type, num_episodes=1000, seeds=[1]):
 
     return all_runs_rewards, best_agent
 
-def plot_reward_results(df_rewards):
-    """מייצר את הגרף המשווה בין מערכות הפרס השונות"""
+def plot_reward_results(df_rewards, n_seeds=1):
+    """מייצר את הגרף המשווה בין מערכות הפרס השונות (עם רווח סמך 95% על פני הסידים)"""
     plt.figure(figsize=(12, 6))
     sns.set_theme(style="darkgrid")
     
-    sns.lineplot(data=df_rewards, x="Episode", y="Original_Reward", hue="Reward_Type", linewidth=2.5)
-    plt.title("Reward Shaping Analysis: Original Reward Convergence (5 Seeds)", fontsize=16, fontweight='bold')
+    # errorbar=("ci", 95): seaborn מפיק רווח סמך 95% אוטומטית כאשר יש כמה סידים לאותו Episode
+    sns.lineplot(data=df_rewards, x="Episode", y="Original_Reward", hue="Reward_Type",
+                 linewidth=2.5, errorbar=("ci", 95))
+    plt.title(f"Reward Comparison: Original Reward Convergence "
+              f"({n_seeds} seed{'s' if n_seeds != 1 else ''}, 95% CI, rolling mean=25)",
+              fontsize=15, fontweight='bold')
     plt.xlabel("Episodes", fontsize=12)
     plt.ylabel("Total Original Env Reward (Smoothed)", fontsize=12)
     plt.legend(title="Reward Types", fontsize=10)
@@ -133,9 +240,20 @@ def plot_reward_results(df_rewards):
     plt.show()
 
 def main():
-    # הרצת הניסויים
+    # 1. הרצת מחקר האבלציה המקיף (גרף שלשה)
+    df_ablation = run_ablation_experiment(num_episodes=1000, seed=1)
+    df_ablation.to_csv("ablation_metrics_results.csv", index=False)
+    plot_ablation_metrics(df_ablation)
+    
+    print("\n[+] מחקר האבלציה הסתיים בהצלחה. ממשיך לניסוי השני של עיצוב הפרסים...")
+    print("========================================================\n")
+
+    # 2. הרצת הניסוי של ה-Reward Shaping (5 מערכות פרס)
     reward_types = ["base", "sparse", "reward_3", "reward_4", "reward_5"]
     num_episodes = 1000
+
+    # ⚠️י.
+    # seeds = [1, 2, 3, 4, 5]
     seeds = [1]
     
     reward_master_data = []
@@ -148,7 +266,6 @@ def main():
             best_base_agent = agent
 
         for seed_idx, run_rewards in enumerate(matrix):
-            # החלקה מבוססת Rolling Mean של 25 פרקים
             smoothed = pd.Series(run_rewards).rolling(window=25, min_periods=1).mean().values
             for ep_idx, r in enumerate(smoothed):
                 reward_master_data.append({
@@ -159,13 +276,12 @@ def main():
                 })
                 
     df_rewards = pd.DataFrame(reward_master_data)
-    df_rewards.to_csv("reward_shaping_results.csv", index=False)
-    print("\n[+] כל נתוני הניסוי נשמרו בהצלחה ל-reward_shaping_results.csv")
+    df_rewards.to_csv("reward_shaping_metrics.csv", index=False)
+    print("\n[+] כל נתוני הניסוי נשמרו בהצלחה ל-reward_shaping_metrics.csv")
     
-    # הפקת הגרף השני לדוח
-    plot_reward_results(df_rewards)
+    plot_reward_results(df_rewards, n_seeds=len(seeds))
 
-    # הצגה ויזואלית של הסוכן הטוב ביותר (BASE) שאומן
+    # 3. הצגה ויזואלית
     print("\n[+] מפעיל תצוגה ויזואלית של הסוכן הטוב ביותר (BASE)...")
     run_and_visualize_policy(best_base_agent, num_episodes=3)
 
