@@ -30,22 +30,14 @@ class GeneralizedSweepingSARSAAgent:
         self.priority_queue = []
 
     def decode_state(self, state):
-        """
-        פענוח מצב גולמי (0-499) לפרמטרים הפיזיים של הסביבה:
+        """פיענוח מצב לפי נוסחת Gymnasium: state = ((row*5 + col)*5 + passenger)*4 + dest
         תשואה: (taxi_row, taxi_col, passenger_location, destination)
         """
-        # גריד המונית הוא 5x5, ויש 5 מצבי נוסע ו-4 מצבי יעד: 5*5*5*4 = 500
-        out = []
-        out.append(state % 4)
-        state = state // 4
-        out.append(state % 5)
-        state = state // 5
-        out.append(state % 5)
-        state = state // 5
-        out.append(state)
-        assert 0 <= state < 5
-        # מחזיר: שורה (0-4), עמודה (0-4), מיקום נוסע (0-4), יעד (0-3)
-        return int(out[3]), int(out[2]), int(out[1]), int(out[0])
+        dest      = state % 4;  state //= 4
+        passenger = state % 5;  state //= 5
+        col       = state % 5
+        row       = state // 5
+        return int(row), int(col), int(passenger), int(dest)
 
     def _compute_kernel(self, s1, s2):
         """חישוב פונקציית הגרעין המתמטית בין שני מצבים"""
@@ -83,6 +75,10 @@ class GeneralizedSweepingSARSAAgent:
         self.q_table[state, action] += self.alpha * td_error
         
         # 2. מנגנון ההכללה (Kernel) - חלחול ידע למצבים דומים מסביב
+        # Standard kernel generalization: Q(ŝ,a) += α · K(s,ŝ) · δ
+        # We spread the *current state's* TD error δ to neighbours weighted by K.
+        # We do NOT compute a separate δ̂ for each neighbour from its own trajectory —
+        # that would require storing full per-state histories and is not the intended design.
         if self.use_kernel:
             r_curr, c_curr, p_curr, d_curr = self.decode_state(state)
             # קידוד: state = row*100 + col*20 + passenger*4 + destination
@@ -113,7 +109,7 @@ class GeneralizedSweepingSARSAAgent:
         return td_error
 
     def _run_planning(self):
-        """לולאת תכנון מבוססת תור עדיפויות - ערך מקסימלי (דטרמיניסטי) במקום epsilon-greedy"""
+        """Prioritized Sweeping with SARSA-style (epsilon-greedy) next-action selection."""
         steps = 0
         while self.priority_queue and steps < self.planning_steps:
             _, s, a = heapq.heappop(self.priority_queue)
@@ -121,9 +117,8 @@ class GeneralizedSweepingSARSAAgent:
                 continue
             r, s_next, d = self.model[(s, a)]
 
-            # תיקון 1: שימוש ב-max Q ולא ב-choose_action - מונע רעש אקראי בתכנון
             q_curr_plan = self.q_table[s, a]
-            q_next_plan = 0 if d else np.max(self.q_table[s_next])
+            q_next_plan = 0.0 if d else self.q_table[s_next, self.choose_action(s_next)]
             td_error_plan = r + self.gamma * q_next_plan - q_curr_plan
 
             self.q_table[s, a] += self.alpha * td_error_plan
@@ -146,8 +141,7 @@ class GeneralizedSweepingSARSAAgent:
                 for (s_pred, a_pred) in self.predecessors[s]:
                     r_pred, _, d_pred = self.model[(s_pred, a_pred)]
                     q_curr_pred = self.q_table[s_pred, a_pred]
-                    # תיקון 1: שימוש ב-max Q גם עבור הקודמים
-                    q_next_pred = 0 if d_pred else np.max(self.q_table[s])
+                    q_next_pred = 0.0 if d_pred else self.q_table[s, self.choose_action(s)]
 
                     td_error_pred = r_pred + self.gamma * q_next_pred - q_curr_pred
                     priority_pred = abs(td_error_pred)
