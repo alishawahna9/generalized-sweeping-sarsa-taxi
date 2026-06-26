@@ -1,0 +1,8 @@
+Reward Design with Generalized Prioritized Sweeping
+
+Seeds: [1, 2, 3, 4, 5]
+Training episodes per experiment: 600
+Sweep episodes per setting: 150
+Default planning steps: 5
+Environment: Taxi-v4, is_rainy=False when supported by Gymnasium.
+Smoothing: rolling mean over the configured window, grouped by config and seed.

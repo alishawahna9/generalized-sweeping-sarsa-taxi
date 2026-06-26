@@ -1,402 +1,908 @@
 import argparse
+import time
+from pathlib import Path
+
 import gymnasium as gym
+import matplotlib
+
+matplotlib.use("Agg")
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
+
+import matplotlib.pyplot as plt
+
 from agent import GeneralizedSweepingSARSAAgent
 from visualize import run_and_visualize_policy
 
+
+sns.set_theme(style="whitegrid")
+
+TAXI_LOCS = [(0, 0), (0, 4), (4, 0), (4, 3)]
+MOVEMENT_ACTIONS = {0, 1, 2, 3}
+
 REWARD_DISPLAY_NAMES = {
-    "base":     "Baseline (Sparse Gym Reward)",
-    "sparse":   "Strict Sparse Reward",
-    "reward_3": "Manhattan Distance Potential",
-    "reward_4": "Subgoal Milestone Reward",
-    "reward_5": "Heuristic Reward Shaping (Bonus)",
+    "base": "Base Environment Reward",
+    "sparse": "Sparse Reward",
+    "reward_3": "Dense Target Progress Reward",
+    "reward_4": "Subgoal Safety Reward",
+    "reward_5": "Composite Remaining Path Reward",
 }
 
-def get_designed_reward(env_reward, state, agent, action, reward_type="base"):
-    """מחשב ומחליף את הפרס המקורי של הסביבה לפי מערכת הפרס הנבחרת"""
+SMOOTHED_METRICS = [
+    "Env_Reward",
+    "Success",
+    "Illegal_Actions",
+]
+
+
+def make_taxi_env(render_mode=None):
+    kwargs = {"is_rainy": False}
+    if render_mode is not None:
+        kwargs["render_mode"] = render_mode
+
+    try:
+        return gym.make("Taxi-v4", **kwargs)
+    except TypeError:
+        kwargs.pop("is_rainy", None)
+        return gym.make("Taxi-v4", **kwargs)
+
+
+def get_current_target_position(state, agent):
+    _, _, passenger_loc, dest_idx = agent.decode_state(state)
+    if passenger_loc < 4:
+        return TAXI_LOCS[passenger_loc]
+    return TAXI_LOCS[dest_idx]
+
+
+def manhattan_to_current_target(state, agent):
+    taxi_row, taxi_col, _, _ = agent.decode_state(state)
+    target_row, target_col = get_current_target_position(state, agent)
+    return abs(taxi_row - target_row) + abs(taxi_col - target_col)
+
+
+def remaining_task_distance(state, agent):
+    taxi_row, taxi_col, passenger_loc, dest_idx = agent.decode_state(state)
+    dest_row, dest_col = TAXI_LOCS[dest_idx]
+
+    if passenger_loc < 4:
+        passenger_row, passenger_col = TAXI_LOCS[passenger_loc]
+        return (
+            abs(taxi_row - passenger_row)
+            + abs(taxi_col - passenger_col)
+            + abs(passenger_row - dest_row)
+            + abs(passenger_col - dest_col)
+        )
+
+    return abs(taxi_row - dest_row) + abs(taxi_col - dest_col)
+
+
+def was_successful_dropoff(env_reward):
+    return env_reward == 20
+
+
+def was_illegal_pickup_or_dropoff(env_reward):
+    return env_reward == -10
+
+
+def was_wall_bump(state, action, next_state):
+    return action in MOVEMENT_ACTIONS and state == next_state
+
+
+def was_successful_pickup(state, next_state, agent):
+    _, _, passenger_before, _ = agent.decode_state(state)
+    _, _, passenger_after, _ = agent.decode_state(next_state)
+    return passenger_before < 4 and passenger_after == 4
+
+
+def calculate_custom_reward(reward_type, env_reward, state, action, next_state, agent):
+    """Return the training reward used by the agent for the selected design."""
     if reward_type == "base":
-        return env_reward
+        return float(env_reward)
 
-    elif reward_type == "sparse":
-        # פרס דליל: +1 על הורדה מוצלח, 0 בשאר הזמן
-        return 1.0 if env_reward == 20 else 0.0
+    success = was_successful_dropoff(env_reward)
+    illegal = was_illegal_pickup_or_dropoff(env_reward)
+    pickup = was_successful_pickup(state, next_state, agent)
+    wall_bump = was_wall_bump(state, action, next_state)
 
-    elif reward_type == "reward_3":
-        # עיצוב אישי א': מבוסס מרחק מנהטן מהיעד הנוכחי
-        taxi_row, taxi_col, pass_loc, dest_idx = agent.decode_state(state)
-        locs = [(0, 0), (0, 4), (4, 0), (4, 3)] # R, G, Y, B
-        target_pos = locs[pass_loc] if pass_loc < 4 else locs[dest_idx]
-        manhattan_dist = abs(taxi_row - target_pos[0]) + abs(taxi_col - target_pos[1])
-        if env_reward == 20:
-            return 20.0
-        return -float(manhattan_dist)
+    old_distance = manhattan_to_current_target(state, agent)
+    new_distance = manhattan_to_current_target(next_state, agent)
+    progress = old_distance - new_distance
 
-    elif reward_type == "reward_4":
-        # עיצוב אישי ב': נהג זהיר - החמרה בעונש על פעולות לא חוקיות
-        if env_reward == -10:
-            return -25.0
-        elif env_reward == 20:
-            return 20.0
-        return -1.0
+    if reward_type == "sparse":
+        return 1.0 if success else 0.0
 
-    elif reward_type == "reward_5":
-        # Potential-Based Reward Shaping (bonus experiment beyond the 4 required designs).
-        # This is NOT a full reward replacement: it returns env_reward + shaping_bonus,
-        # preserving the original signal while adding a potential-difference term.
-        # Included for comparison only — it does not count as one of the 4 required reward designs.
-        taxi_row, taxi_col, pass_loc, dest_idx = agent.decode_state(state)
-        locs = [(0, 0), (0, 4), (4, 0), (4, 3)] # R, G, Y, B
-        target_pos = locs[pass_loc] if pass_loc < 4 else locs[dest_idx]
-        current_dist = abs(taxi_row - target_pos[0]) + abs(taxi_col - target_pos[1])
-        prev_row, prev_col = taxi_row, taxi_col
-        if action == 0:   prev_row -= 1
-        elif action == 1: prev_row += 1
-        elif action == 2: prev_col -= 1
-        elif action == 3: prev_col += 1
-        prev_row = max(0, min(4, prev_row))
-        prev_col = max(0, min(4, prev_col))
-        prev_dist = abs(prev_row - target_pos[0]) + abs(prev_col - target_pos[1])
-        shaping = float(prev_dist - current_dist)
-        return env_reward + shaping
+    if reward_type == "reward_3":
+        reward = 0.75 * progress - 0.05
+        if pickup:
+            reward += 2.0
+        if success:
+            reward += 5.0
+        if illegal:
+            reward -= 2.0
+        if wall_bump:
+            reward -= 0.5
+        return float(reward)
 
-    return env_reward
+    if reward_type == "reward_4":
+        reward = -0.10
+        if pickup:
+            reward += 3.0
+        if success:
+            reward += 10.0
+        if illegal:
+            reward -= 4.0
+        if wall_bump:
+            reward -= 1.0
+        if progress < 0:
+            reward -= 0.25
+        return float(reward)
 
-def run_ablation_experiment(num_episodes=1000, seeds=[1]):
-    """מריץ מחקר אבלציה על 4 קונפיגורציות, על פני כל ה-seeds, ואוסף 3 מטריקות"""
-    configurations = {
-        "1. Pure SARSA":          {"planning": False, "kernel": False},
-        "2. SARSA + Planning":    {"planning": True,  "kernel": False},
-        "3. SARSA + Kernel":      {"planning": False, "kernel": True},
-        "4. Full Framework":      {"planning": True,  "kernel": True}
-    }
+    if reward_type == "reward_5":
+        distance_before = remaining_task_distance(state, agent)
+        distance_after = remaining_task_distance(next_state, agent)
+        max_path = 16.0
 
-    ablation_master_data = []
-    print("\n========================================================")
-    print(f"Running Ablation Study over {len(seeds)} seed(s)")
-    print("========================================================")
+        reward = (distance_before - distance_after) / max_path
+        reward -= 0.02
 
-    for seed in seeds:
-        # Seed numpy RNG before creating env/agent so all random choices are reproducible
-        print(f"\n--- Seed {seed} ---")
+        if success:
+            reward += 1.0
+        if illegal:
+            reward -= 0.3
 
-        for config_name, flags in configurations.items():
-            np.random.seed(seed)
-            # Seed numpy RNG before creating env/agent so all random choices are reproducible
-            print(f">>> Running configuration: {config_name}...")
-            env = gym.make("Taxi-v4", is_rainy=False)
-            agent = GeneralizedSweepingSARSAAgent(
-                alpha=0.1, gamma=0.95, epsilon=0.1,
-                use_planning=flags["planning"], planning_steps=10,
-                use_kernel=flags["kernel"], beta=4.0, c=0.5
+        return float(reward)
+
+    raise ValueError(f"Unknown reward type: {reward_type}")
+
+
+def train_agent(env, agent, num_episodes=1000, reward_type="base", seed=None):
+    episode_records = []
+
+    for episode in range(1, num_episodes + 1):
+        reset_seed = None if seed is None else seed * 100_000 + episode
+        state, _ = env.reset(seed=reset_seed)
+        action = agent.choose_action(state)
+
+        done = False
+        env_reward_total = 0.0
+        illegal_actions = 0
+        success = False
+
+        while not done:
+            next_state, env_reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            train_reward = calculate_custom_reward(
+                reward_type,
+                env_reward,
+                state,
+                action,
+                next_state,
+                agent,
+            )
+            next_action = agent.choose_action(next_state)
+            agent.learn(
+                state,
+                action,
+                train_reward,
+                next_state,
+                next_action,
+                done,
             )
 
-            for episode in range(num_episodes):
-                state, _ = env.reset(seed=seed * 100 + episode)
-                action = agent.choose_action(state)
-                done = False
-                total_env_reward = 0
-                illegal_actions_count = 0
-                td_errors_in_episode = []
+            success = success or was_successful_dropoff(env_reward)
+            illegal_actions += int(was_illegal_pickup_or_dropoff(env_reward))
+            env_reward_total += env_reward
 
-                while not done:
-                    next_state, env_reward, terminated, truncated, _ = env.step(action)
-                    done = terminated or truncated
-                    custom_reward = get_designed_reward(env_reward, state, agent, action, reward_type="base")
-                    if env_reward == -10:
-                        illegal_actions_count += 1
-                    next_action = agent.choose_action(next_state)
-                    td_error = agent.update(state, action, custom_reward, next_state, next_action, done)
-                    td_errors_in_episode.append(abs(td_error))
-                    state = next_state
-                    action = next_action
-                    total_env_reward += env_reward
+            state = next_state
+            action = next_action
 
-                mean_td_error = np.mean(td_errors_in_episode) if td_errors_in_episode else 0.0
-                ablation_master_data.append({
-                    "Episode": episode + 1,
-                    "Config_Name": config_name,
-                    "Seed": seed,
-                    "Original_Reward": total_env_reward,
-                    "Illegal_Actions": illegal_actions_count,
-                    "Mean_Absolute_TD_Error": mean_td_error
-                })
+        agent.decay_epsilon()
+        episode_records.append(
+            {
+                "Episode": episode,
+                "Reward_Type": reward_type,
+                "Env_Reward": env_reward_total,
+                "Success": int(success),
+                "Illegal_Actions": illegal_actions,
+                "Epsilon": agent.epsilon,
+            }
+        )
 
-            env.close()
-            print(f"  - Configuration complete.")
+    return episode_records
 
-    return pd.DataFrame(ablation_master_data)
 
-def plot_ablation_metrics(df_ablation, n_seeds=1):
-    """מייצר גרף משולש (3 מטריקות) עבור מחקר האבלציה עם CI 95% על פני seeds"""
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    sns.set_theme(style="darkgrid")
-    df_smoothed = df_ablation.copy()
-    df_smoothed["Original_Reward"] = df_smoothed["Original_Reward"].astype(float)
-    df_smoothed["Illegal_Actions"] = df_smoothed["Illegal_Actions"].astype(float)
-    df_smoothed["Mean_Absolute_TD_Error"] = df_smoothed["Mean_Absolute_TD_Error"].astype(float)
+def slugify(value):
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
 
-    # Smooth per (Config_Name, Seed) to avoid rolling across seed boundaries
-    for config in df_smoothed["Config_Name"].unique():
-        for seed in df_smoothed["Seed"].unique():
-            mask = (df_smoothed["Config_Name"] == config) & (df_smoothed["Seed"] == seed)
-            for col in ["Original_Reward", "Illegal_Actions", "Mean_Absolute_TD_Error"]:
-                df_smoothed.loc[mask, col] = (
-                    df_smoothed.loc[mask, col].rolling(window=25, min_periods=1).mean()
+
+def models_dir(output_dir):
+    output_dir = Path(output_dir)
+    return output_dir / "models"
+
+
+def smooth_metrics(df, smoothing_window):
+    window = max(1, int(smoothing_window))
+    group_cols = ["Config", "Seed"]
+
+    for metric in SMOOTHED_METRICS:
+        df[f"Smoothed_{metric}"] = df.groupby(group_cols)[metric].transform(
+            lambda values: values.rolling(window=window, min_periods=1).mean()
+        )
+
+    return df
+
+
+def lineplot_with_ci(data, x, y, hue, style=None, markers=False):
+    kwargs = {
+        "data": data,
+        "x": x,
+        "y": y,
+        "hue": hue,
+        "markers": markers,
+    }
+    if style is not None:
+        kwargs["style"] = style
+
+    try:
+        return sns.lineplot(**kwargs, errorbar=("ci", 95))
+    except TypeError:
+        return sns.lineplot(**kwargs, ci=95)
+
+
+def save_ablation_plots(df, output_dir):
+    plot_specs = [
+        ("base", "Env_Reward", "Environment reward"),
+        ("base", "Success", "Success rate"),
+        ("reward_4", "Env_Reward", "Environment reward"),
+        ("reward_4", "Success", "Success rate"),
+    ]
+
+    for reward_type, metric, ylabel in plot_specs:
+        plot_df = df[df["Reward_Type"] == reward_type]
+        plt.figure(figsize=(11, 6))
+        lineplot_with_ci(
+            data=plot_df,
+            x="Episode",
+            y=f"Smoothed_{metric}",
+            hue="Setup",
+        )
+        plt.title(f"Ablation Study - {REWARD_DISPLAY_NAMES[reward_type]} - {ylabel}")
+        plt.xlabel("Episode")
+        plt.ylabel(ylabel)
+        if metric == "Success":
+            plt.ylim(-0.05, 1.05)
+        plt.tight_layout()
+        plt.savefig(
+            output_dir / f"ablation_{reward_type}_{slugify(metric)}.png",
+            dpi=180,
+        )
+        plt.close()
+
+
+def save_reward_comparison_plots(df, output_dir):
+    plot_specs = [
+        ("Env_Reward", "Environment reward"),
+        ("Success", "Success rate"),
+    ]
+
+    for metric, ylabel in plot_specs:
+        plt.figure(figsize=(11, 6))
+        lineplot_with_ci(
+            data=df,
+            x="Episode",
+            y=f"Smoothed_{metric}",
+            hue="Config",
+        )
+        plt.title(f"Reward Comparison - {ylabel}")
+        plt.xlabel("Episode")
+        plt.ylabel(ylabel)
+        if metric == "Success":
+            plt.ylim(-0.05, 1.05)
+        plt.tight_layout()
+        plt.savefig(output_dir / f"reward_comparison_{slugify(metric)}.png", dpi=180)
+        plt.close()
+
+
+def agent_params_from_config(config):
+    meta_keys = {
+        "reward_type",
+        "setup_name",
+        "agent_name",
+        "save_family",
+    }
+    return {key: value for key, value in config.items() if key not in meta_keys}
+
+
+def save_model_artifact(agent, output_dir, family, reward_type, agent_name, seed):
+    model_dir = models_dir(output_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    file_path = model_dir / f"{family}__{reward_type}__{agent_name}__seed_{seed}.npz"
+    np.savez_compressed(
+        file_path,
+        q_table=agent.q_table,
+        reward_type=reward_type,
+        agent_name=agent_name,
+        seed=seed,
+        family=family,
+    )
+
+
+def infer_saved_model_family(agent_name):
+    if agent_name == "full":
+        return "reward_comparison"
+    return "ablation"
+
+
+def load_saved_model(output_dir, agent_name, reward_type, seed, planning_steps):
+    if agent_name != "full" and reward_type not in {"base", "reward_4"}:
+        raise ValueError(
+            "Saved non-full models are available only for rewards: base, reward_4."
+        )
+
+    family = infer_saved_model_family(agent_name)
+    file_path = models_dir(output_dir) / f"{family}__{reward_type}__{agent_name}__seed_{seed}.npz"
+    if not file_path.exists():
+        raise FileNotFoundError(f"Saved model not found: {file_path}")
+
+    agent = GeneralizedSweepingSARSAAgent(
+        **visualization_agent_configs(planning_steps)[agent_name]
+    )
+    with np.load(file_path) as data:
+        agent.q_table = data["q_table"]
+    return agent, file_path
+
+
+def run_experiment(
+    configs,
+    num_episodes,
+    seeds,
+    exp_name,
+    output_dir,
+    smoothing_window,
+    save_models=True,
+    make_plots=True,
+):
+    print("\n========================================================")
+    print(f"Running {exp_name}: {len(configs)} configs, {len(seeds)} seed(s)")
+    print("========================================================")
+
+    started = time.perf_counter()
+    all_records = []
+
+    for config_name, config in configs.items():
+        reward_type = config.get("reward_type", "base")
+        setup_name = config.get("setup_name", config_name)
+        agent_name = config.get("agent_name")
+        save_family = config.get("save_family")
+        print(f">>> {config_name}")
+
+        for seed in seeds:
+            np.random.seed(seed)
+            env = make_taxi_env()
+            agent = GeneralizedSweepingSARSAAgent(**agent_params_from_config(config))
+
+            try:
+                records = train_agent(
+                    env,
+                    agent,
+                    num_episodes=num_episodes,
+                    reward_type=reward_type,
+                    seed=seed,
+                )
+            finally:
+                env.close()
+
+            if save_models and agent_name and save_family:
+                save_model_artifact(
+                    agent,
+                    output_dir,
+                    save_family,
+                    reward_type,
+                    agent_name,
+                    seed,
                 )
 
-    # seaborn aggregates over duplicate (Episode, Config_Name) rows (i.e., across seeds)
-    errorbar_arg = ("ci", 95) if n_seeds > 1 else None
-    ci_label = f", 95% CI over {n_seeds} seeds" if n_seeds > 1 else f" (seed={df_ablation['Seed'].iloc[0]})"
+            for record in records:
+                record["Config"] = config_name
+                record["Seed"] = seed
+                record["Setup"] = setup_name
+                all_records.append(record)
 
-    sns.lineplot(data=df_smoothed, x="Episode", y="Original_Reward",
-                 hue="Config_Name", ax=axes[0], linewidth=2, errorbar=errorbar_arg)
-    axes[0].set_title("1. Cumulative Original Reward", fontsize=12, fontweight='bold')
-    axes[0].set_ylabel("Total Reward (Smoothed)")
+    df = pd.DataFrame(all_records)
+    df = smooth_metrics(df, smoothing_window)
 
-    sns.lineplot(data=df_smoothed, x="Episode", y="Illegal_Actions",
-                 hue="Config_Name", ax=axes[1], linewidth=2, errorbar=errorbar_arg)
-    axes[1].set_title("2. Number of Illegal Actions", fontsize=12, fontweight='bold')
-    axes[1].set_ylabel("Illegal Actions Per Episode")
+    csv_path = output_dir / f"{slugify(exp_name)}.csv"
+    df.to_csv(csv_path, index=False)
 
-    sns.lineplot(data=df_smoothed, x="Episode", y="Mean_Absolute_TD_Error",
-                 hue="Config_Name", ax=axes[2], linewidth=2, errorbar=errorbar_arg)
-    axes[2].set_title("3. Mean Absolute TD Error", fontsize=12, fontweight='bold')
-    axes[2].set_ylabel("Absolute TD Error")
+    if make_plots:
+        if exp_name == "Component Ablation":
+            save_ablation_plots(df, output_dir)
+        elif exp_name == "Reward Comparison":
+            save_reward_comparison_plots(df, output_dir)
 
-    plt.suptitle(
-        f"Ablation Study: Analysis of 3 Complementary Metrics{ci_label}",
-        fontsize=16, fontweight='bold', y=1.02
-    )
-    plt.tight_layout()
-    plt.savefig("ablation_study_3_metrics.png", dpi=300, bbox_inches='tight')
-    print("\n[+] Ablation study graph saved: ablation_study_3_metrics.png")
-    plt.show()
+    elapsed = time.perf_counter() - started
+    print(f"[+] Saved {csv_path.name} in {elapsed / 60:.2f} minutes")
+    return df
 
-def run_reward_experiment(reward_type, num_episodes=1000, seeds=[1]):
-    """מריץ את המודל המלא על פני סידים עבור מערכת פרס ספציפית"""
-    all_runs_rewards = []
-    best_agent = None
-    best_score = -np.inf
-    print(f"\n>>> Running reward experiment: {REWARD_DISPLAY_NAMES.get(reward_type, reward_type.upper())} over {len(seeds)} seed(s)...")
 
-    for seed in seeds:
-        # Seed numpy RNG before creating env/agent for full reproducibility
-        np.random.seed(seed)
-        env = gym.make("Taxi-v4", is_rainy=False)
-        agent = GeneralizedSweepingSARSAAgent(
-            alpha=0.1, gamma=0.95, epsilon=0.1,
-            use_planning=True, planning_steps=10, use_kernel=True, beta=4.0, c=0.5
-        )
+def calculate_epsilon_decay(num_episodes):
+    return 0.05 ** (1.0 / (0.6 * num_episodes))
 
-        rewards_per_episode = []
-        for episode in range(num_episodes):
-            state, info = env.reset(seed=seed * 100 + episode)
-            action = agent.choose_action(state)
-            done = False
-            total_env_reward = 0
 
-            while not done:
-                next_state, env_reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                custom_reward = get_designed_reward(env_reward, state, agent, action, reward_type=reward_type)
-                next_action = agent.choose_action(next_state)
-                agent.update(state, action, custom_reward, next_state, next_action, done)
-                state = next_state
-                action = next_action
-                total_env_reward += env_reward
+def component_ablation_configs(planning_steps, epsilon_decay):
+    configs = {}
+    setup_specs = [
+        (
+            "Pure SARSA",
+            "pure_sarsa",
+            {
+                "epsilon_decay": epsilon_decay,
+                "use_planning": False,
+                "use_kernel": False,
+            },
+        ),
+        (
+            "SARSA + Planning",
+            "planning",
+            {
+                "alpha": 0.3,
+                "epsilon_decay": epsilon_decay,
+                "use_planning": True,
+                "use_kernel": False,
+                "planning_steps": planning_steps,
+            },
+        ),
+        (
+            "SARSA + Kernel",
+            "kernel",
+            {
+                "alpha": 0.5,
+                "beta": 4.0,
+                "c": 0.5,
+                "epsilon_decay": epsilon_decay,
+                "max_kernel_neighbors": 4,
+                "kernel_scale": 0.5,
+                "use_planning": False,
+                "use_kernel": True,
+            },
+        ),
+        (
+            "Full Framework",
+            "full",
+            {
+                "alpha": 0.5,
+                "epsilon_decay": epsilon_decay,
+                "beta": 4.0,
+                "c": 0.5,
+                "max_kernel_neighbors": 4,
+                "kernel_scale": 0.5,
+                "use_planning": True,
+                "use_kernel": True,
+                "planning_steps": planning_steps,
+            },
+        ),
+    ]
 
-            rewards_per_episode.append(total_env_reward)
+    for reward_type in ("base", "reward_4"):
+        reward_name = REWARD_DISPLAY_NAMES[reward_type]
+        for setup_name, agent_name, params in setup_specs:
+            configs[f"{reward_name} | {setup_name}"] = {
+                "reward_type": reward_type,
+                "setup_name": setup_name,
+                "agent_name": agent_name,
+                "save_family": "ablation",
+                **params,
+            }
 
-        all_runs_rewards.append(rewards_per_episode)
-        env.close()
+    return configs
 
-        seed_score = np.mean(rewards_per_episode[-100:])
-        print(f"  - Seed {seed} done. Avg reward (last 100 eps): {seed_score:.1f}")
 
-        if seed_score > best_score:
-            best_score = seed_score
-            best_agent = agent
+def reward_comparison_configs(planning_steps, epsilon_decay):
+    return {
+        display_name: {
+            "reward_type": reward_type,
+            "setup_name": display_name,
+            "agent_name": "full",
+            "save_family": "reward_comparison",
+            "alpha": 0.5,
+            "epsilon_decay": epsilon_decay,
+            "beta": 4.0,
+            "c": 0.5,
+            "max_kernel_neighbors": 4,
+            "kernel_scale": 0.5,
+            "use_planning": True,
+            "use_kernel": True,
+            "planning_steps": planning_steps,
+        }
+        for reward_type, display_name in REWARD_DISPLAY_NAMES.items()
+    }
 
-    return all_runs_rewards, best_agent
 
-def plot_reward_results(df_rewards, n_seeds=1):
-    """מייצר את הגרף המשווה בין מערכות הפרס השונות (עם רווח סמך 95% על פני הסידים)"""
-    plt.figure(figsize=(12, 6))
-    sns.set_theme(style="darkgrid")
-    # CI bands are only meaningful and safe to compute with more than one seed
-    errorbar_arg = ("ci", 95) if n_seeds > 1 else None
-    sns.lineplot(data=df_rewards, x="Episode", y="Original_Reward", hue="Reward_Type",
-                 linewidth=2.5, errorbar=errorbar_arg)
-    ci_label = ", 95% CI" if n_seeds > 1 else ""
-    plt.title(
-        f"Reward Comparison: Original Reward Convergence "
-        f"({n_seeds} seed{'s' if n_seeds != 1 else ''}{ci_label}, rolling mean=25)",
-        fontsize=15, fontweight='bold'
-    )
-    plt.xlabel("Episodes", fontsize=12)
-    plt.ylabel("Total Original Env Reward (Smoothed)", fontsize=12)
-    plt.legend(title="Reward Types", fontsize=10)
-    plt.savefig("reward_shaping_results.png", dpi=300, bbox_inches='tight')
-    print("\n[+] Reward comparison graph saved: reward_shaping_results.png")
-    plt.show()
+def visualization_agent_configs(planning_steps):
+    return {
+        "pure_sarsa": {
+            "use_planning": False,
+            "use_kernel": False,
+            "planning_steps": planning_steps,
+        },
+        "planning": {
+            "alpha": 0.3,
+            "use_planning": True,
+            "use_kernel": False,
+            "planning_steps": planning_steps,
+        },
+        "kernel": {
+            "alpha": 0.5,
+            "beta": 4.0,
+            "c": 0.5,
+            "max_kernel_neighbors": 4,
+            "kernel_scale": 0.5,
+            "use_planning": False,
+            "use_kernel": True,
+            "planning_steps": planning_steps,
+        },
+        "full": {
+            "alpha": 0.5,
+            "beta": 4.0,
+            "c": 0.5,
+            "max_kernel_neighbors": 4,
+            "kernel_scale": 0.5,
+            "use_planning": True,
+            "use_kernel": True,
+            "planning_steps": planning_steps,
+        },
+    }
 
-def run_parameter_sweep(alphas, planning_steps_list, reward_types, seeds, num_episodes=500):
-    """Runs a 2D grid search over alpha x planning_steps for each reward_type."""
-    results = {}
-    total = len(alphas) * len(planning_steps_list) * len(reward_types)
-    count = 0
 
-    print(f"\n{'='*60}")
-    print(f"2D Parameter Sweep ({total} configs x {len(seeds)} seed(s))")
-    print(f"{'='*60}")
+def mean_tail(records, metric, tail_window=50):
+    tail = records[-min(tail_window, len(records)) :]
+    return float(np.mean([row[metric] for row in tail]))
 
-    for r_type in reward_types:
-        matrix = np.zeros((len(alphas), len(planning_steps_list)))
 
-        for i, alpha in enumerate(alphas):
-            for j, n_steps in enumerate(planning_steps_list):
-                count += 1
-                seed_scores = []
+def ci95(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size < 2:
+        return 0.0
+    return float(1.96 * np.std(values, ddof=1) / np.sqrt(values.size))
 
+
+def run_parameter_sweep(
+    seeds,
+    sweep_episodes,
+    epsilon_decay,
+    output_dir,
+    make_plots=True,
+):
+    print("\n========================================================")
+    print("Running Parameter Sweep: alpha x planning_steps")
+    print("========================================================")
+
+    rows = []
+    alpha_values = [0.2, 0.8]
+    planning_step_values = [2, 10]
+    reward_types = ["base", "reward_4"]
+
+    started = time.perf_counter()
+
+    for reward_type in reward_types:
+        for alpha in alpha_values:
+            for planning_steps in planning_step_values:
                 for seed in seeds:
-                    # Seed numpy RNG before creating env/agent for full reproducibility
                     np.random.seed(seed)
-                    env = gym.make("Taxi-v4", is_rainy=False)
+                    env = make_taxi_env()
                     agent = GeneralizedSweepingSARSAAgent(
-                        alpha=alpha, gamma=0.95, epsilon=0.1,
-                        use_planning=True, planning_steps=n_steps,
-                        use_kernel=True, beta=4.0, c=0.5
+                        alpha=alpha,
+                        beta=4.0,
+                        c=0.5,
+                        max_kernel_neighbors=4,
+                        kernel_scale=0.5,
+                        epsilon_decay=epsilon_decay,
+                        planning_steps=planning_steps,
+                        use_planning=True,
+                        use_kernel=True,
                     )
 
-                    episode_rewards = []
-                    for episode in range(num_episodes):
-                        state, _ = env.reset(seed=seed * 100 + episode)
-                        action = agent.choose_action(state)
-                        done = False
-                        total_reward = 0
+                    try:
+                        records = train_agent(
+                            env,
+                            agent,
+                            num_episodes=sweep_episodes,
+                            reward_type=reward_type,
+                            seed=seed,
+                        )
+                    finally:
+                        env.close()
 
-                        while not done:
-                            next_state, env_reward, terminated, truncated, _ = env.step(action)
-                            done = terminated or truncated
-                            custom_reward = get_designed_reward(
-                                env_reward, state, agent, action, reward_type=r_type
-                            )
-                            next_action = agent.choose_action(next_state)
-                            agent.update(state, action, custom_reward, next_state, next_action, done)
-                            state = next_state
-                            action = next_action
-                            total_reward += env_reward
+                    rows.append(
+                        {
+                            "Reward_Type": reward_type,
+                            "Reward_Name": REWARD_DISPLAY_NAMES[reward_type],
+                            "Alpha": alpha,
+                            "Planning_Steps": planning_steps,
+                            "Seed": seed,
+                            "Final_Env_Reward": mean_tail(records, "Env_Reward"),
+                            "Final_Success_Rate": mean_tail(records, "Success"),
+                            "Final_Illegal_Actions": mean_tail(records, "Illegal_Actions"),
+                        }
+                    )
 
-                        episode_rewards.append(total_reward)
+                print(
+                    "  "
+                    f"{reward_type}, alpha={alpha}, planning_steps={planning_steps}"
+                )
 
-                    env.close()
-                    seed_scores.append(np.mean(episode_rewards[-100:]))
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "parameter_sweep_seed_results.csv", index=False)
 
-                mean_score = np.mean(seed_scores)
-                matrix[i, j] = mean_score
-                print(f"  [{count}/{total}] {REWARD_DISPLAY_NAMES.get(r_type, r_type.upper())}: alpha={alpha}, n={n_steps} -> score={mean_score:.2f}")
-
-        results[r_type] = matrix
-
-    return results
-
-def plot_sweep_heatmaps(sweep_results, alphas, planning_steps_list, n_seeds=1):
-    """Displays one heatmap per reward type from the 2D parameter sweep."""
-    n_plots = len(sweep_results)
-    _, axes = plt.subplots(1, n_plots, figsize=(8 * n_plots, 6))
-    if n_plots == 1:
-        axes = [axes]
-
-    cbar_label = f"Mean Avg Reward — last 100 eps, mean over {n_seeds} seed{'s' if n_seeds != 1 else ''}"
-
-    for ax, (r_type, matrix) in zip(axes, sweep_results.items()):
-        df_heat = pd.DataFrame(
-            matrix,
-            index=[f"a={a}" for a in alphas],
-            columns=[f"n={n}" for n in planning_steps_list]
+    group_cols = ["Reward_Type", "Reward_Name", "Alpha", "Planning_Steps"]
+    summary = (
+        df.groupby(group_cols)
+        .agg(
+            Final_Env_Reward_Mean=("Final_Env_Reward", "mean"),
+            Final_Env_Reward_CI95=("Final_Env_Reward", ci95),
+            Final_Success_Rate_Mean=("Final_Success_Rate", "mean"),
+            Final_Success_Rate_CI95=("Final_Success_Rate", ci95),
+            Final_Illegal_Actions_Mean=("Final_Illegal_Actions", "mean"),
+            Final_Illegal_Actions_CI95=("Final_Illegal_Actions", ci95),
         )
-        sns.heatmap(df_heat, annot=True, fmt=".1f", cmap="YlOrRd", ax=ax,
-                    linewidths=0.5, cbar_kws={"label": cbar_label})
-        ax.set_title(REWARD_DISPLAY_NAMES.get(r_type, r_type.upper()), fontsize=13, fontweight='bold')
-        ax.set_xlabel("Planning Steps (n)", fontsize=11)
-        ax.set_ylabel("Learning Rate (alpha)", fontsize=11)
-
-    plt.suptitle(
-        f"2D Parameter Sweep: Learning Rate (alpha) x Planning Steps (n)"
-        f"  [{n_seeds} seed{'s' if n_seeds != 1 else ''}, mean performance]",
-        fontsize=15, fontweight='bold'
+        .reset_index()
     )
-    plt.tight_layout()
-    plt.savefig("parameter_sweep_heatmap.png", dpi=300, bbox_inches='tight')
-    print("\n[+] Parameter sweep heatmap saved: parameter_sweep_heatmap.png")
-    plt.show()
+    summary.to_csv(output_dir / "parameter_sweep_summary.csv", index=False)
+
+    if make_plots:
+        save_sweep_plots(df, summary, output_dir)
+
+    elapsed = time.perf_counter() - started
+    print(f"[+] Saved parameter sweep in {elapsed / 60:.2f} minutes")
+    return df, summary
+
+
+def save_sweep_plots(df, summary, output_dir):
+    for reward_type, reward_df in summary.groupby("Reward_Type"):
+        heatmap_data = reward_df.pivot(
+            index="Alpha",
+            columns="Planning_Steps",
+            values="Final_Env_Reward_Mean",
+        )
+        plt.figure(figsize=(7, 5))
+        sns.heatmap(heatmap_data, annot=True, cmap="viridis", fmt=".2f")
+        plt.title(f"{REWARD_DISPLAY_NAMES[reward_type]}: Mean final environment reward")
+        plt.tight_layout()
+        plt.savefig(
+            output_dir / f"parameter_sweep_{reward_type}_env_reward_heatmap.png",
+            dpi=180,
+        )
+        plt.close()
+
+
+def write_run_manifest(output_dir, seeds, episodes, sweep_episodes, planning_steps):
+    lines = [
+        "Reward Design with Generalized Prioritized Sweeping",
+        "",
+        f"Seeds: {seeds}",
+        f"Training episodes per experiment: {episodes}",
+        f"Sweep episodes per setting: {sweep_episodes}",
+        f"Default planning steps: {planning_steps}",
+        "Environment: Taxi-v4, is_rainy=False when supported by Gymnasium.",
+        "Smoothing: rolling mean over the configured window, grouped by config and seed.",
+    ]
+    (output_dir / "run_manifest.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run Taxi-v4 reward-design experiments with SARSA, prioritized sweeping, and kernel generalization."
+    )
+    parser.add_argument("--seed", dest="seeds", type=int, action="append")
+    parser.add_argument("--fast", action="store_true", help="Short seed-1 development run.")
+    parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--sweep-episodes", type=int, default=None)
+    parser.add_argument("--planning-steps", type=int, default=5)
+    parser.add_argument("--smoothing-window", type=int, default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--skip-sweep", action="store_true")
+    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument(
+        "--visualize-only",
+        action="store_true",
+        help="Train and render a policy without rerunning all experiments.",
+    )
+    parser.add_argument(
+        "--visualize-saved",
+        action="store_true",
+        help="Load a saved trained policy from results/models and render it.",
+    )
+    parser.add_argument(
+        "--visualize-agent",
+        choices=["pure_sarsa", "planning", "kernel", "full"],
+        default="full",
+        help="Agent setup to train for the pygame animation.",
+    )
+    parser.add_argument(
+        "--visualize-reward",
+        choices=list(REWARD_DISPLAY_NAMES),
+        default="base",
+    )
+    parser.add_argument("--visualize-episodes", type=int, default=1)
+    return parser.parse_args()
+
+
+def resolve_run_settings(args):
+    if args.fast:
+        seeds = args.seeds or [1]
+        episodes = args.episodes or 300
+        sweep_episodes = args.sweep_episodes or 200
+        smoothing_window = args.smoothing_window or 25
+    elif args.visualize_only or args.visualize_saved:
+        seeds = args.seeds or [1, 2, 3, 4, 5]
+        episodes = args.episodes or 600
+        sweep_episodes = args.sweep_episodes or 150
+        smoothing_window = args.smoothing_window or 50
+    else:
+        seeds = args.seeds or [1, 2, 3, 4, 5]
+        episodes = args.episodes or 600
+        sweep_episodes = args.sweep_episodes or 400
+        smoothing_window = args.smoothing_window or 50
+
+    return seeds, episodes, sweep_episodes, smoothing_window
+
+
+def visualize_saved_policies(args, seeds):
+    print("\n[+] Loading saved policies for visualization...")
+    print(
+        "[+] Visualization setup: "
+        f"agent={args.visualize_agent}, reward={args.visualize_reward}, seeds={seeds}"
+    )
+
+    loaded_any = False
+    for seed in seeds:
+        try:
+            agent, model_path = load_saved_model(
+                args.output_dir,
+                args.visualize_agent,
+                args.visualize_reward,
+                seed,
+                args.planning_steps,
+            )
+        except FileNotFoundError:
+            print(f"\n[-] No saved model found for seed {seed}; skipping.")
+            continue
+
+        loaded_any = True
+        print(f"\n[+] Loaded saved model for seed {seed}: {model_path.name}")
+        run_and_visualize_policy(
+            agent,
+            num_episodes=args.visualize_episodes,
+            max_steps=150,
+            delay=0.10,
+            start_seed=seed,
+        )
+
+    if not loaded_any:
+        raise FileNotFoundError(
+            "No saved models matched the requested agent/reward/seed selection."
+        )
+
+
+def visualize_trained_policies(args, seeds, episodes):
+    print("\n[+] Training policies for visualization...")
+    print(
+        "[+] Visualization setup: "
+        f"agent={args.visualize_agent}, reward={args.visualize_reward}, "
+        f"episodes={episodes}, seeds={seeds}"
+    )
+
+    agent_config = visualization_agent_configs(args.planning_steps)[args.visualize_agent]
+    agent_config["epsilon_decay"] = calculate_epsilon_decay(episodes)
+
+    for seed in seeds:
+        print(f"\n[+] Training visualization policy for seed {seed}...")
+        np.random.seed(seed)
+        env = make_taxi_env()
+        agent = GeneralizedSweepingSARSAAgent(**agent_config)
+
+        try:
+            records = train_agent(
+                env,
+                agent,
+                num_episodes=episodes,
+                reward_type=args.visualize_reward,
+                seed=seed,
+            )
+        finally:
+            env.close()
+
+        tail_success = mean_tail(records, "Success")
+        tail_reward = mean_tail(records, "Env_Reward")
+        tail_illegal = mean_tail(records, "Illegal_Actions")
+        print(
+            "[+] Seed "
+            f"{seed} training tail: success={tail_success:.2f}, "
+            f"reward={tail_reward:.2f}, illegal={tail_illegal:.2f}"
+        )
+
+        run_and_visualize_policy(
+            agent,
+            num_episodes=args.visualize_episodes,
+            max_steps=150,
+            delay=0.10,
+            start_seed=seed,
+        )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Taxi RL Experiments")
-    parser.add_argument('--fast', action='store_true',
-                        help="Quick single-seed run; disables CI bands and uses fewer episodes")
-    args = parser.parse_args()
+    args = parse_args()
+    if args.visualize_only or args.visualize_saved:
+        args.visualize = True
 
-    SEEDS = [1] if args.fast else [1, 2, 3, 4, 5]
-    num_episodes   = 500 if args.fast else 1000
-    sweep_episodes = 200 if args.fast else 500
+    seeds, episodes, sweep_episodes, smoothing_window = resolve_run_settings(args)
+    epsilon_decay = calculate_epsilon_decay(episodes)
+    sweep_epsilon_decay = calculate_epsilon_decay(sweep_episodes)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Running experiments over {len(SEEDS)} seed(s) "
-          f"({'fast mode' if args.fast else 'full mode'})")
-
-    # 1. Ablation study over all seeds (CI shown when len(SEEDS) > 1)
-    df_ablation = run_ablation_experiment(num_episodes=num_episodes, seeds=SEEDS)
-    df_ablation.to_csv("ablation_metrics_results.csv", index=False)
-    plot_ablation_metrics(df_ablation, n_seeds=len(SEEDS))
-
-    print("\n[+] Ablation study complete. Moving to reward shaping experiment...")
-    print("========================================================\n")
-
-    # 2. Reward shaping comparison across 5 reward systems
-    reward_types = ["base", "sparse", "reward_3", "reward_4", "reward_5"]
-    reward_master_data = []
-    best_base_agent = None
-
-    for r_type in reward_types:
-        matrix, agent = run_reward_experiment(
-            reward_type=r_type, num_episodes=num_episodes, seeds=SEEDS
-        )
-        if r_type == "base":
-            best_base_agent = agent
-
-        for seed_idx, run_rewards in enumerate(matrix):
-            smoothed = pd.Series(run_rewards).rolling(window=25, min_periods=1).mean().values
-            for ep_idx, r in enumerate(smoothed):
-                reward_master_data.append({
-                    "Episode": ep_idx + 1,
-                    "Original_Reward": r,
-                    "Reward_Type": REWARD_DISPLAY_NAMES[r_type],
-                    "Seed": SEEDS[seed_idx]
-                })
-
-    df_rewards = pd.DataFrame(reward_master_data)
-    df_rewards.to_csv("reward_shaping_metrics.csv", index=False)
-    print("\n[+] Reward experiment data saved: reward_shaping_metrics.csv")
-    plot_reward_results(df_rewards, n_seeds=len(SEEDS))
-
-    # 3. 2D Parameter Sweep: alpha x planning_steps on base and reward_3
-    sweep_results = run_parameter_sweep(
-        alphas=[0.01, 0.1, 0.5],
-        planning_steps_list=[5, 10, 25],
-        reward_types=["base", "reward_3"],
-        seeds=SEEDS,
-        num_episodes=sweep_episodes
+    write_run_manifest(
+        args.output_dir,
+        seeds,
+        episodes,
+        sweep_episodes,
+        args.planning_steps,
     )
-    plot_sweep_heatmaps(sweep_results, [0.01, 0.1, 0.5], [5, 10, 25], n_seeds=len(SEEDS))
 
-    # 4. Policy visualization
-    print("\n[+] Visualizing best BASE agent policy...")
-    run_and_visualize_policy(best_base_agent, num_episodes=3)
+    make_plots = not args.no_plots
+    started = time.perf_counter()
 
-    print("\n[+] All experiments completed successfully!")
+    ablation_df = pd.DataFrame()
+    reward_df = pd.DataFrame()
+
+    if not args.visualize_only and not args.visualize_saved:
+        ablation_df = run_experiment(
+            component_ablation_configs(args.planning_steps, epsilon_decay),
+            episodes,
+            seeds,
+            "Component Ablation",
+            args.output_dir,
+            smoothing_window,
+            make_plots=make_plots,
+        )
+
+        reward_df = run_experiment(
+            reward_comparison_configs(args.planning_steps, epsilon_decay),
+            episodes,
+            seeds,
+            "Reward Comparison",
+            args.output_dir,
+            smoothing_window,
+            make_plots=make_plots,
+        )
+
+        if not args.skip_sweep:
+            run_parameter_sweep(
+                seeds,
+                sweep_episodes,
+                sweep_epsilon_decay,
+                args.output_dir,
+                make_plots=make_plots,
+            )
+
+    if args.visualize:
+        if args.visualize_saved:
+            visualize_saved_policies(args, seeds)
+        else:
+            visualize_trained_policies(args, seeds, episodes)
+
+    elapsed = time.perf_counter() - started
+    print("\n[+] All requested experiments completed.")
+    print(f"[+] Results directory: {args.output_dir.resolve()}")
+    print(f"[+] Total runtime: {elapsed / 60:.2f} minutes")
+    print(
+        "[+] Rows saved: "
+        f"ablation={len(ablation_df)}, reward_comparison={len(reward_df)}"
+    )
+
 
 if __name__ == "__main__":
     main()
