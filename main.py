@@ -12,6 +12,7 @@ import pandas as pd
 import seaborn as sns
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 from agent import GeneralizedSweepingSARSAAgent
 from visualize import run_and_visualize_policy
@@ -252,12 +253,116 @@ def lineplot_with_ci(data, x, y, hue, style=None, markers=False):
         return sns.lineplot(**kwargs, ci=95)
 
 
+def apply_metric_axis_zoom(plot_df, metric, experiment_family=None):
+    if plot_df.empty:
+        return
+
+    if "Episode" in plot_df:
+        plt.xlim(0, plot_df["Episode"].max())
+
+    if metric == "Success":
+        plt.ylim(-0.05, 1.05)
+        return
+
+    smoothed_col = f"Smoothed_{metric}"
+    if smoothed_col not in plot_df:
+        return
+
+    values_df = plot_df
+    if metric == "Env_Reward" and experiment_family != "ablation":
+        max_episode = plot_df["Episode"].max()
+        values_df = plot_df[plot_df["Episode"] >= max_episode * 0.10]
+
+    values = values_df[smoothed_col].dropna()
+    if values.empty:
+        return
+
+    if metric == "Illegal_Actions" and experiment_family == "ablation":
+        lower = 0.0
+        upper = float(values.max())
+    elif metric == "Illegal_Actions":
+        lower = 0.0
+        upper = float(values.quantile(0.95))
+    else:
+        lower = float(values.quantile(0.05))
+        upper = float(values.quantile(0.98))
+
+    if lower == upper:
+        padding = max(1.0, abs(lower) * 0.10)
+    else:
+        padding = (upper - lower) * 0.12
+
+    if metric == "Illegal_Actions":
+        plt.ylim(max(0.0, lower - padding), upper + padding)
+    else:
+        plt.ylim(lower - padding, upper + padding)
+
+
+def add_ablation_zoom_inset(plot_df, metric):
+    if metric not in {"Env_Reward", "Illegal_Actions"} or plot_df.empty:
+        return
+
+    smoothed_col = f"Smoothed_{metric}"
+    if smoothed_col not in plot_df:
+        return
+
+    max_episode = plot_df["Episode"].max()
+    zoom_df = plot_df[plot_df["Episode"] >= max_episode * 0.35]
+    values = zoom_df[smoothed_col].dropna()
+    if values.empty:
+        return
+
+    ax = plt.gca()
+    zoom_ax = inset_axes(ax, width="42%", height="42%", loc="center right", borderpad=2)
+    try:
+        sns.lineplot(
+            data=zoom_df,
+            x="Episode",
+            y=smoothed_col,
+            hue="Setup",
+            errorbar=("ci", 95),
+            legend=False,
+            ax=zoom_ax,
+        )
+    except TypeError:
+        sns.lineplot(
+            data=zoom_df,
+            x="Episode",
+            y=smoothed_col,
+            hue="Setup",
+            ci=95,
+            legend=False,
+            ax=zoom_ax,
+        )
+
+    if metric == "Illegal_Actions":
+        lower = 0.0
+        upper = float(values.quantile(0.95))
+    else:
+        lower = float(values.quantile(0.05))
+        upper = float(values.quantile(0.98))
+
+    padding = max(0.5, (upper - lower) * 0.12)
+    zoom_ax.set_xlim(max_episode * 0.35, max_episode)
+    if metric == "Illegal_Actions":
+        zoom_ax.set_ylim(0.0, upper + padding)
+    else:
+        zoom_ax.set_ylim(lower - padding, upper + padding)
+
+    zoom_ax.set_title("Zoomed late training", fontsize=9)
+    zoom_ax.set_xlabel("")
+    zoom_ax.set_ylabel("")
+    zoom_ax.tick_params(labelsize=8)
+
+
 def save_ablation_plots(df, output_dir):
+    for obsolete_plot in output_dir.glob("ablation_reward_4_*.png"):
+        obsolete_plot.unlink()
+
     plot_specs = [
         ("base", "Env_Reward", "Environment reward"),
         ("base", "Success", "Success rate"),
-        ("reward_4", "Env_Reward", "Environment reward"),
-        ("reward_4", "Success", "Success rate"),
+        ("base", "Illegal_Actions", "Illegal actions"),
     ]
 
     for reward_type, metric, ylabel in plot_specs:
@@ -272,8 +377,8 @@ def save_ablation_plots(df, output_dir):
         plt.title(f"Ablation Study - {REWARD_DISPLAY_NAMES[reward_type]} - {ylabel}")
         plt.xlabel("Episode")
         plt.ylabel(ylabel)
-        if metric == "Success":
-            plt.ylim(-0.05, 1.05)
+        apply_metric_axis_zoom(plot_df, metric, experiment_family="ablation")
+        add_ablation_zoom_inset(plot_df, metric)
         plt.tight_layout()
         plt.savefig(
             output_dir / f"ablation_{reward_type}_{slugify(metric)}.png",
@@ -286,6 +391,7 @@ def save_reward_comparison_plots(df, output_dir):
     plot_specs = [
         ("Env_Reward", "Environment reward"),
         ("Success", "Success rate"),
+        ("Illegal_Actions", "Illegal actions"),
     ]
 
     for metric, ylabel in plot_specs:
@@ -299,8 +405,7 @@ def save_reward_comparison_plots(df, output_dir):
         plt.title(f"Reward Comparison - {ylabel}")
         plt.xlabel("Episode")
         plt.ylabel(ylabel)
-        if metric == "Success":
-            plt.ylim(-0.05, 1.05)
+        apply_metric_axis_zoom(df, metric, experiment_family="reward_comparison")
         plt.tight_layout()
         plt.savefig(output_dir / f"reward_comparison_{slugify(metric)}.png", dpi=180)
         plt.close()
@@ -428,10 +533,6 @@ def run_experiment(
     return df
 
 
-def calculate_epsilon_decay(num_episodes):
-    return 0.05 ** (1.0 / (0.6 * num_episodes))
-
-
 def component_ablation_configs(planning_steps, epsilon_decay):
     configs = {}
     setup_specs = [
@@ -486,7 +587,7 @@ def component_ablation_configs(planning_steps, epsilon_decay):
         ),
     ]
 
-    for reward_type in ("base", "reward_4"):
+    for reward_type in ("base",):
         reward_name = REWARD_DISPLAY_NAMES[reward_type]
         for setup_name, agent_name, params in setup_specs:
             configs[f"{reward_name} | {setup_name}"] = {
@@ -739,12 +840,12 @@ def resolve_run_settings(args):
         smoothing_window = args.smoothing_window or 25
     elif args.visualize_only or args.visualize_saved:
         seeds = args.seeds or [1, 2, 3, 4, 5]
-        episodes = args.episodes or 600
+        episodes = args.episodes or 500
         sweep_episodes = args.sweep_episodes or 150
         smoothing_window = args.smoothing_window or 50
     else:
         seeds = args.seeds or [1, 2, 3, 4, 5]
-        episodes = args.episodes or 600
+        episodes = args.episodes or 500
         sweep_episodes = args.sweep_episodes or 400
         smoothing_window = args.smoothing_window or 50
 
@@ -797,7 +898,8 @@ def visualize_trained_policies(args, seeds, episodes):
     )
 
     agent_config = visualization_agent_configs(args.planning_steps)[args.visualize_agent]
-    agent_config["epsilon_decay"] = calculate_epsilon_decay(episodes)
+    agent_config["epsilon"] = 0.3
+    agent_config["epsilon_decay"] = 1.0
 
     for seed in seeds:
         print(f"\n[+] Training visualization policy for seed {seed}...")
@@ -840,8 +942,9 @@ def main():
         args.visualize = True
 
     seeds, episodes, sweep_episodes, smoothing_window = resolve_run_settings(args)
-    epsilon_decay = calculate_epsilon_decay(episodes)
-    sweep_epsilon_decay = calculate_epsilon_decay(sweep_episodes)
+   
+    epsilon_decay = 0.3
+    sweep_epsilon_decay = 1.0
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     write_run_manifest(
