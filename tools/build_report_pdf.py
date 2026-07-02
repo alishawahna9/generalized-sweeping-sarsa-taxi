@@ -86,8 +86,8 @@ def make_styles(font_name):
             name="ReportBody",
             parent=styles["BodyText"],
             fontName=font_name,
-            fontSize=10.5,
-            leading=14,
+            fontSize=11,
+            leading=14.5,
             alignment=TA_LEFT,
             spaceAfter=6,
         )
@@ -97,11 +97,24 @@ def make_styles(font_name):
             name="ReportBullet",
             parent=styles["BodyText"],
             fontName=font_name,
-            fontSize=10.5,
-            leading=14,
+            fontSize=11,
+            leading=14.5,
             leftIndent=14,
             firstLineIndent=-8,
             spaceAfter=3,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="Caption",
+            parent=styles["BodyText"],
+            fontName=font_name,
+            fontSize=9,
+            leading=11,
+            alignment=TA_CENTER,
+            textColor=colors.dimgray,
+            spaceBefore=3,
+            spaceAfter=8,
         )
     )
     styles.add(
@@ -160,6 +173,29 @@ def markdown_to_flowables(markdown, styles):
             story.append(Spacer(1, 3))
             pending_bullets = []
 
+    def add_image(alt_text, image_path):
+        path = Path(image_path)
+        if not path.is_absolute():
+            path = ROOT / image_path
+        if not path.exists():
+            story.append(
+                Paragraph(
+                    clean_inline(f"[Missing figure: {image_path}]"),
+                    styles["ReportBody"],
+                )
+            )
+            return
+
+        image = Image(str(path))
+        max_width = 6.5 * inch
+        max_height = 3.55 * inch
+        scale = min(max_width / image.imageWidth, max_height / image.imageHeight, 1.0)
+        image.drawWidth = image.imageWidth * scale
+        image.drawHeight = image.imageHeight * scale
+        story.append(image)
+        if alt_text:
+            story.append(Paragraph(clean_inline(f"Figure: {alt_text}"), styles["Caption"]))
+
     for raw_line in markdown.splitlines():
         line = raw_line.rstrip()
 
@@ -179,6 +215,12 @@ def markdown_to_flowables(markdown, styles):
         if not line.strip():
             flush_bullets()
             story.append(Spacer(1, 3))
+            continue
+
+        image_match = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", line)
+        if image_match:
+            flush_bullets()
+            add_image(image_match.group(1), image_match.group(2))
             continue
 
         if line.startswith("# "):

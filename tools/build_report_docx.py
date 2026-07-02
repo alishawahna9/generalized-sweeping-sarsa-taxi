@@ -13,6 +13,7 @@ from docx.shared import Inches, Pt, RGBColor
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "reports" / "final_report.md"
 OUTPUT = ROOT / "reports" / "final_report.docx"
+CONTENT_WIDTH = Inches(6.5)
 
 
 def set_cell_margins(cell, top=80, start=120, bottom=80, end=120):
@@ -102,6 +103,17 @@ def configure_styles(doc):
     code.paragraph_format.space_after = Pt(6)
     code.paragraph_format.left_indent = Inches(0.15)
 
+    if "Caption" not in styles:
+        caption = styles.add_style("Caption", WD_STYLE_TYPE.PARAGRAPH)
+    else:
+        caption = styles["Caption"]
+    caption.font.name = "Calibri"
+    caption.font.size = Pt(9)
+    caption.font.color.rgb = RGBColor(89, 89, 89)
+    caption.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    caption.paragraph_format.space_before = Pt(3)
+    caption.paragraph_format.space_after = Pt(8)
+
 
 def add_text_with_inline_code(paragraph, text):
     parts = re.split(r"(`[^`]+`)", text)
@@ -161,6 +173,26 @@ def add_simple_table(doc, rows):
     doc.add_paragraph()
 
 
+def add_image(doc, alt_text, image_path):
+    path = Path(image_path)
+    if not path.is_absolute():
+        path = ROOT / image_path
+
+    if not path.exists():
+        paragraph = doc.add_paragraph()
+        add_text_with_inline_code(paragraph, f"[Missing figure: {image_path}]")
+        return
+
+    paragraph = doc.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = paragraph.add_run()
+    run.add_picture(str(path), width=CONTENT_WIDTH)
+
+    if alt_text:
+        caption = doc.add_paragraph(style="Caption")
+        caption.add_run(f"Figure: {alt_text}")
+
+
 def parse_table(lines):
     rows = []
     for line in lines:
@@ -216,6 +248,12 @@ def build_docx():
             continue
 
         if not raw.strip():
+            i += 1
+            continue
+
+        image_match = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", raw)
+        if image_match:
+            add_image(doc, image_match.group(1), image_match.group(2))
             i += 1
             continue
 

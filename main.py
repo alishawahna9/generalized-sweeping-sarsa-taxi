@@ -1,5 +1,6 @@
 import argparse
 import time
+from collections import deque
 from pathlib import Path
 
 import gymnasium as gym
@@ -22,6 +23,9 @@ sns.set_theme(style="whitegrid")
 
 TAXI_LOCS = [(0, 0), (0, 4), (4, 0), (4, 3)]
 MOVEMENT_ACTIONS = {0, 1, 2, 3}
+TAXI_SUCCESS_REWARD = 20
+TAXI_ILLEGAL_REWARD = -10
+DEFAULT_TAXI_MAX_EPISODE_STEPS = 200
 
 REWARD_DISPLAY_NAMES = {
     "base": "Base Environment Reward",
@@ -33,6 +37,7 @@ REWARD_DISPLAY_NAMES = {
 
 SMOOTHED_METRICS = [
     "Env_Reward",
+    "Normalized_Env_Reward",
     "Success",
     "Illegal_Actions",
 ]
@@ -48,6 +53,67 @@ def make_taxi_env(render_mode=None):
     except TypeError:
         kwargs.pop("is_rainy", None)
         return gym.make("Taxi-v4", **kwargs)
+
+
+def get_max_episode_steps(env):
+    spec = getattr(env, "spec", None)
+    return getattr(spec, "max_episode_steps", None) or DEFAULT_TAXI_MAX_EPISODE_STEPS
+
+
+def get_min_episode_reward(env):
+    return TAXI_ILLEGAL_REWARD * get_max_episode_steps(env)
+
+
+def optimal_env_reward_for_state(start_state, transitions, num_actions):
+    queue = deque([(int(start_state), 0)])
+    visited = {int(start_state)}
+
+    while queue:
+        state, steps = queue.popleft()
+
+        for action in range(num_actions):
+            for (
+                probability,
+                next_state,
+                reward,
+                terminated,
+            ) in transitions[state][action]:
+                if probability <= 0 or reward == TAXI_ILLEGAL_REWARD:
+                    continue
+
+                next_steps = steps + 1
+                if terminated:
+                    if reward == TAXI_SUCCESS_REWARD:
+                        return float(TAXI_SUCCESS_REWARD - (next_steps - 1))
+                    continue
+
+                next_state = int(next_state)
+                if next_state not in visited:
+                    visited.add(next_state)
+                    queue.append((next_state, next_steps))
+
+    return np.nan
+
+
+def optimal_env_rewards_by_state(env):
+    transitions = env.unwrapped.P
+    return {
+        state: optimal_env_reward_for_state(
+            state,
+            transitions,
+            env.action_space.n,
+        )
+        for state in range(env.observation_space.n)
+    }
+
+
+def normalize_env_reward(env_reward, optimal_env_reward, min_episode_reward):
+    denominator = optimal_env_reward - min_episode_reward
+    if not np.isfinite(denominator) or denominator <= 0:
+        return np.nan
+
+    normalized = (env_reward - min_episode_reward) / denominator
+    return float(np.clip(normalized, 0.0, 1.0))
 
 
 def get_current_target_position(state, agent):
@@ -80,11 +146,11 @@ def remaining_task_distance(state, agent):
 
 
 def was_successful_dropoff(env_reward):
-    return env_reward == 20
+    return env_reward == TAXI_SUCCESS_REWARD
 
 
 def was_illegal_pickup_or_dropoff(env_reward):
-    return env_reward == -10
+    return env_reward == TAXI_ILLEGAL_REWARD
 
 
 def was_wall_bump(state, action, next_state):
@@ -160,20 +226,25 @@ def calculate_custom_reward(reward_type, env_reward, state, action, next_state, 
 
 def train_agent(env, agent, num_episodes=1000, reward_type="base", seed=None):
     episode_records = []
+    min_episode_reward = get_min_episode_reward(env)
+    optimal_env_rewards = optimal_env_rewards_by_state(env)
 
     for episode in range(1, num_episodes + 1):
         reset_seed = None if seed is None else seed * 100_000 + episode
         state, _ = env.reset(seed=reset_seed)
+        initial_state = int(state)
         action = agent.choose_action(state)
 
         done = False
         env_reward_total = 0.0
+        episode_length = 0
         illegal_actions = 0
         success = False
 
         while not done:
             next_state, env_reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
+            episode_length += 1
 
             train_reward = calculate_custom_reward(
                 reward_type,
@@ -201,12 +272,21 @@ def train_agent(env, agent, num_episodes=1000, reward_type="base", seed=None):
             action = next_action
 
         agent.decay_epsilon()
+        optimal_env_reward = optimal_env_rewards[initial_state]
         episode_records.append(
             {
                 "Episode": episode,
                 "Reward_Type": reward_type,
+                "Initial_State": initial_state,
                 "Env_Reward": env_reward_total,
+                "Optimal_Env_Reward": optimal_env_reward,
+                "Normalized_Env_Reward": normalize_env_reward(
+                    env_reward_total,
+                    optimal_env_reward,
+                    min_episode_reward,
+                ),
                 "Success": int(success),
+                "Episode_Length": episode_length,
                 "Illegal_Actions": illegal_actions,
                 "Epsilon": agent.epsilon,
             }
@@ -260,7 +340,7 @@ def apply_metric_axis_zoom(plot_df, metric, experiment_family=None):
     if "Episode" in plot_df:
         plt.xlim(0, plot_df["Episode"].max())
 
-    if metric == "Success":
+    if metric in {"Success", "Normalized_Env_Reward"}:
         plt.ylim(-0.05, 1.05)
         return
 
@@ -389,12 +469,12 @@ def save_ablation_plots(df, output_dir):
 
 def save_reward_comparison_plots(df, output_dir):
     plot_specs = [
-        ("Env_Reward", "Environment reward"),
-        ("Success", "Success rate"),
-        ("Illegal_Actions", "Illegal actions"),
+        ("Normalized_Env_Reward", "Normalized environment reward", "env_reward"),
+        ("Success", "Success rate", "success"),
+        ("Illegal_Actions", "Illegal actions", "illegal_actions"),
     ]
 
-    for metric, ylabel in plot_specs:
+    for metric, ylabel, file_slug in plot_specs:
         plt.figure(figsize=(11, 6))
         lineplot_with_ci(
             data=df,
@@ -407,7 +487,7 @@ def save_reward_comparison_plots(df, output_dir):
         plt.ylabel(ylabel)
         apply_metric_axis_zoom(df, metric, experiment_family="reward_comparison")
         plt.tight_layout()
-        plt.savefig(output_dir / f"reward_comparison_{slugify(metric)}.png", dpi=180)
+        plt.savefig(output_dir / f"reward_comparison_{file_slug}.png", dpi=180)
         plt.close()
 
 
@@ -854,6 +934,7 @@ def resolve_run_settings(args):
 
 def visualize_saved_policies(args, seeds):
     print("\n[+] Loading saved policies for visualization...")
+
     print(
         "[+] Visualization setup: "
         f"agent={args.visualize_agent}, reward={args.visualize_reward}, seeds={seeds}"
