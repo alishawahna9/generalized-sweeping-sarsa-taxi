@@ -61,6 +61,8 @@ max_kernel_neighbors = 4
 kernel_scale = 0.5
 ```
 
+The discount factor was fixed at gamma = 0.99 across all reward comparisons, parameter sweeps, and component ablations. I kept gamma constant intentionally because changing gamma would change the discounted MDP itself and would make the reward and algorithm comparisons less meaningful.
+
 Epsilon decays over training. The decay is selected so exploration becomes much smaller after a substantial part of training, while still leaving a small amount of random action selection.
 
 ### 4.1 Prioritized Sweeping
@@ -223,6 +225,8 @@ The main metrics are:
 - Illegal actions: number of illegal pickup/dropoff actions.
 - Episode length: number of steps taken.
 
+I did not use training reward as a cross-reward comparison metric because the designed rewards have different scales. I also avoided claiming unique-state and mean-TD-error plots in the final report because those metrics are not currently saved in the main result CSV files. The analysis therefore focuses on metrics that are present, reproducible, and comparable across the saved runs.
+
 ## 8. Best Policy Visualization
 
 The project supports Gymnasium's Taxi visualization. Saved policies can be animated without retraining:
@@ -231,14 +235,28 @@ The project supports Gymnasium's Taxi visualization. Saved policies can be anima
 python main.py --visualize-saved
 ```
 
-Specific reward designs can be visualized with:
+In addition to the live command, I generated one successful saved-policy animation for each reward design. The GIF files are included in `reports/policy_animations/`:
+
+```text
+base_policy.gif
+sparse_policy.gif
+reward_3_policy.gif
+reward_4_policy.gif
+reward_5_policy.gif
+```
+
+The GIFs were produced from Gymnasium `render_mode="rgb_array"` frames using saved Q-tables from `results/models`. The following contact sheet shows the final frame from each successful animation:
+
+![Best policy animation contact sheet](reports/policy_animations/policy_animation_contact_sheet.png)
+
+The same policies can also be visualized live with:
 
 ```bash
-python main.py --visualize-saved --visualize-reward base --seed 2
-python main.py --visualize-saved --visualize-reward sparse --seed 2
-python main.py --visualize-saved --visualize-reward reward_3 --seed 2
-python main.py --visualize-saved --visualize-reward reward_4 --seed 2
-python main.py --visualize-saved --visualize-reward reward_5 --seed 2
+python main.py --visualize-saved --visualize-reward base --seed 1
+python main.py --visualize-saved --visualize-reward sparse --seed 1
+python main.py --visualize-saved --visualize-reward reward_3 --seed 1
+python main.py --visualize-saved --visualize-reward reward_4 --seed 1
+python main.py --visualize-saved --visualize-reward reward_5 --seed 1
 ```
 
 During development, some saved policies succeeded immediately while others entered loops for certain seeds. This is a useful reminder that a single animation is not the whole evaluation. The plots and confidence intervals are needed because Taxi learning is seed-sensitive.

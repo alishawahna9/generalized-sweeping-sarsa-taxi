@@ -34,6 +34,12 @@ Optional policy animation after training:
 python main.py --seed 1 --visualize --visualize-reward base
 ```
 
+Saved successful policy GIFs for each reward are included under:
+
+```bash
+reports/policy_animations/
+```
+
 Only train and show an animation, without rerunning all experiment plots:
 
 ```bash
@@ -65,8 +71,8 @@ By default, results are written to `results/`:
 - SARSA real updates and SARSA-style Prioritized Sweeping planning updates.
 - Symmetric logistic kernel over taxi Manhattan distance, restricted to states with the same passenger status/location and destination.
 - Four required reward designs: base, sparse, reward 3, reward 4.
-- Additional potential-based shaping comparison as reward 5.
+- Additional custom Composite Remaining Path reward as reward 5.
 - Component ablations with and without planning and kernel.
 - Parameter sweep over two parameters: learning rate `alpha` and planning steps `n`.
-- Metrics: environment reward, training reward, success, episode length, illegal actions, wall bumps, unique states, mean absolute TD error.
+- Metrics saved in the main CSVs: environment reward, normalized environment reward, success, episode length, and illegal pickup/dropoff actions.
 - Reproducible seeds and a single-seed command for faster checking.
