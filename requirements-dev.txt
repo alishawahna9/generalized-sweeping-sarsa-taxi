@@ -1,0 +1,7 @@
+# Report/animation tooling only - not needed to run the experiments (main.py).
+# Pillow: saves policy animation GIFs (make_policy_gifs.py).
+# reportlab / python-docx / pypdf: build the PDF/DOCX report from reports/final_report.md.
+Pillow==12.3.0
+reportlab==4.4.9
+python-docx==1.2.0
+pypdf==6.10.0

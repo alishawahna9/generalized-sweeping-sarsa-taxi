@@ -4,10 +4,16 @@ This project trains Taxi-v4 agents with SARSA, optional Prioritized Sweeping, an
 
 ## Quick Start
 
-Install dependencies:
+Install experiment dependencies:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+Optional report/animation tooling (GIF export, PDF/DOCX report building):
+
+```bash
+python -m pip install -r requirements-dev.txt
 ```
 
 Full reproducible run with 5 seeds:
@@ -34,10 +40,31 @@ Optional policy animation after training:
 python main.py --seed 1 --visualize --visualize-reward base
 ```
 
+Saved-policy visualization first scores 100 candidate start seeds per saved/trained
+model seed and renders the best episode found. To change that search size:
+
+```bash
+python main.py --visualize-saved --visualize-candidates 300
+```
+
+Use `--visualize-candidates 1` to show only the original start seed.
+
+For the clearest live demo of the saved models across all seeds and reward designs:
+
+```bash
+python run_trained_model.py
+```
+
 Saved successful policy GIFs for each reward are included under:
 
 ```bash
 reports/policy_animations/
+```
+
+To regenerate the GIFs from the saved Q-tables in `results/models` (requires `requirements-dev.txt`):
+
+```bash
+python make_policy_gifs.py
 ```
 
 Only train and show an animation, without rerunning all experiment plots:
@@ -52,7 +79,7 @@ Show one seed only:
 python main.py --seed 1 --visualize-only
 ```
 
-`--visualize-only` trains the full framework for 400 episodes per seed by default.
+`--visualize-only` trains the full framework for 500 episodes per seed by default.
 
 ## Outputs
 
@@ -61,7 +88,8 @@ By default, results are written to `results/`:
 - `component_ablation.csv` plus smoothed line plots with 95% CI.
 - `reward_comparison.csv` plus smoothed line plots with 95% CI.
 - `parameter_sweep_seed_results.csv` and `parameter_sweep_summary.csv`.
-- Parameter sweep line plots and heatmaps.
+- `models/*.npz` saved Q-tables for visualization and GIF generation.
+- Parameter sweep heatmaps (mean ± 95% CI annotated in each cell).
 - `run_manifest.txt` with the exact run settings.
 
 ## Implemented Requirements

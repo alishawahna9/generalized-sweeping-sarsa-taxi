@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+tmp/
+*.inspect.ndjson
+.venv/
+venv/
+.submission_check_venv/
+results/.matplotlib-cache/
+_doc_review/
+_ppt_review/
+reports/render_v5/
+submission_ready_*/
+submission_ready_*.zip
+212274237_Ali-Shawahna_212697692_Maimas-Aamar_207431859_Rober-Saliba/
+212274237_Ali-Shawahna_212697692_Maimas-Aamar_207431859_Rober-Saliba.zip

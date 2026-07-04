@@ -1,11 +1,13 @@
 import argparse
+import os
 import time
 from collections import deque
 from pathlib import Path
 
+os.environ.setdefault("MPLCONFIGDIR", str((Path("results") / ".matplotlib-cache").resolve()))
+
 import gymnasium as gym
 import matplotlib
-
 matplotlib.use("Agg")
 
 import numpy as np
@@ -41,6 +43,16 @@ SMOOTHED_METRICS = [
     "Success",
     "Illegal_Actions",
 ]
+
+
+def calculate_epsilon_decay(num_episodes, final_fraction=0.05, horizon_fraction=0.6):
+    """Per-episode multiplicative epsilon decay.
+
+    Chosen so epsilon shrinks to ~final_fraction of its starting value after
+    horizon_fraction of training, keeping meaningful exploration for most of
+    the run before settling near epsilon_min.
+    """
+    return final_fraction ** (1.0 / (horizon_fraction * num_episodes))
 
 
 def make_taxi_env(render_mode=None):
@@ -762,8 +774,8 @@ def run_parameter_sweep(
     print("========================================================")
 
     rows = []
-    alpha_values = [0.2, 0.8]
-    planning_step_values = [2, 10]
+    alpha_values = [0.2, 0.5, 0.8]
+    planning_step_values = [2, 5, 10]
     reward_types = ["base", "reward_4"]
 
     started = time.perf_counter()
@@ -842,15 +854,29 @@ def run_parameter_sweep(
 
 
 def save_sweep_plots(df, summary, output_dir):
+    n_seeds = df["Seed"].nunique()
     for reward_type, reward_df in summary.groupby("Reward_Type"):
         heatmap_data = reward_df.pivot(
             index="Alpha",
             columns="Planning_Steps",
             values="Final_Env_Reward_Mean",
         )
-        plt.figure(figsize=(7, 5))
-        sns.heatmap(heatmap_data, annot=True, cmap="viridis", fmt=".2f")
-        plt.title(f"{REWARD_DISPLAY_NAMES[reward_type]}: Mean final environment reward")
+        ci_data = reward_df.pivot(
+            index="Alpha",
+            columns="Planning_Steps",
+            values="Final_Env_Reward_CI95",
+        )
+        annotations = (
+            heatmap_data.round(2).astype(str)
+            + "\n±"
+            + ci_data.round(2).astype(str)
+        )
+        plt.figure(figsize=(8, 5))
+        sns.heatmap(heatmap_data, annot=annotations, cmap="viridis", fmt="")
+        plt.title(
+            f"{REWARD_DISPLAY_NAMES[reward_type]}: "
+            f"Mean final environment reward (±95% CI, {n_seeds} seed(s))"
+        )
         plt.tight_layout()
         plt.savefig(
             output_dir / f"parameter_sweep_{reward_type}_env_reward_heatmap.png",
@@ -909,6 +935,12 @@ def parse_args():
         default="base",
     )
     parser.add_argument("--visualize-episodes", type=int, default=1)
+    parser.add_argument(
+        "--visualize-candidates",
+        type=int,
+        default=100,
+        help="Number of candidate start seeds to score before rendering the best visualization episode.",
+    )
     return parser.parse_args()
 
 
@@ -937,7 +969,8 @@ def visualize_saved_policies(args, seeds):
 
     print(
         "[+] Visualization setup: "
-        f"agent={args.visualize_agent}, reward={args.visualize_reward}, seeds={seeds}"
+        f"agent={args.visualize_agent}, reward={args.visualize_reward}, "
+        f"seeds={seeds}, candidates={args.visualize_candidates}"
     )
 
     loaded_any = False
@@ -962,6 +995,7 @@ def visualize_saved_policies(args, seeds):
             max_steps=150,
             delay=0.10,
             start_seed=seed,
+            candidate_count=args.visualize_candidates,
         )
 
     if not loaded_any:
@@ -975,7 +1009,7 @@ def visualize_trained_policies(args, seeds, episodes):
     print(
         "[+] Visualization setup: "
         f"agent={args.visualize_agent}, reward={args.visualize_reward}, "
-        f"episodes={episodes}, seeds={seeds}"
+        f"episodes={episodes}, seeds={seeds}, candidates={args.visualize_candidates}"
     )
 
     agent_config = visualization_agent_configs(args.planning_steps)[args.visualize_agent]
@@ -1014,6 +1048,7 @@ def visualize_trained_policies(args, seeds, episodes):
             max_steps=150,
             delay=0.10,
             start_seed=seed,
+            candidate_count=args.visualize_candidates,
         )
 
 
@@ -1024,17 +1059,18 @@ def main():
 
     seeds, episodes, sweep_episodes, smoothing_window = resolve_run_settings(args)
    
-    epsilon_decay = 0.3
+    epsilon_decay = calculate_epsilon_decay(episodes)
     sweep_epsilon_decay = 1.0
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    write_run_manifest(
-        args.output_dir,
-        seeds,
-        episodes,
-        sweep_episodes,
-        args.planning_steps,
-    )
+    if not args.visualize_only and not args.visualize_saved:
+        write_run_manifest(
+            args.output_dir,
+            seeds,
+            episodes,
+            sweep_episodes,
+            args.planning_steps,
+        )
 
     make_plots = not args.no_plots
     started = time.perf_counter()

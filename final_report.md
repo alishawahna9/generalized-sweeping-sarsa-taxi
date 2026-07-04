@@ -8,7 +8,7 @@ Date: July 2026
 
 ## 1. AI Use Disclaimer
 
-I used AI assistance, mainly ChatGPT/Codex, during this project. The assistance was used for debugging, checking the project requirements, improving the experiment runner, structuring the report, and clarifying reinforcement learning concepts. AI also helped draft and revise some report text. The implementation choices, experiment interpretation, and final responsibility for the submission remain mine. The main algorithmic components, reward designs, and conclusions were reviewed against the project instructions and the actual code/results in this repository.
+I used AI assistance from OpenAI's ChatGPT/Codex and Anthropic's Claude during this project to support understanding of RL concepts, debugging, checking project requirements, improving the experiment runner, and revising parts of the report. After I decided on the project architecture, reward designs, and experiment structure, AI helped draft and refine implementation snippets and explanations. All AI-suggested code, text, and conclusions were reviewed, tested, and adapted against the project instructions and the actual results. The final implementation decisions, experiment interpretation, conclusions, and responsibility for the submission remain mine.
 
 ## 2. Work Beyond the Minimum Requirements
 
@@ -18,7 +18,8 @@ The minimum project requires four reward designs, SARSA, prioritized sweeping, a
 - The fifth reward is a custom Composite Remaining Path reward.
 - The reward comparison plot uses a normalized environment reward so different training reward scales do not distort the main comparison.
 - Trained Q-tables are saved under `results/models`, so policies can be visualized without retraining.
-- `explain_simulation.py` provides a step-by-step explanation of one learned episode.
+- `run_trained_model.py` provides a clear live demonstration of the saved models across seeds and reward designs.
+- `make_policy_gifs.py` generates GIF artifacts from saved Q-tables.
 - A `--fast` mode gives a short single-seed development run.
 
 The extra reward design is discussed in Section 5.5. The normalized reward comparison is discussed in Section 9.2. The saved-policy visualization workflow is discussed in Section 8 and Section 13.
@@ -53,6 +54,7 @@ alpha = 0.5
 gamma = 0.99
 epsilon starts at 0.3
 epsilon_min = 0.01
+epsilon_decay = 0.05 ** (1 / (0.6 * num_episodes))  (per-episode multiplicative)
 planning_steps n = 5
 theta = 1e-4
 beta = 4.0
@@ -63,7 +65,7 @@ kernel_scale = 0.5
 
 The discount factor was fixed at gamma = 0.99 across all reward comparisons, parameter sweeps, and component ablations. I kept gamma constant intentionally because changing gamma would change the discounted MDP itself and would make the reward and algorithm comparisons less meaningful.
 
-Epsilon decays over training. The decay is selected so exploration becomes much smaller after a substantial part of training, while still leaving a small amount of random action selection.
+Epsilon decays multiplicatively each episode with decay factor 0.05 ** (1 / (0.6 * num_episodes)). This factor is chosen so epsilon shrinks to about 5% of its starting value after 60% of training (for example, with 500 episodes the factor is about 0.9901, so epsilon reaches roughly 0.015 around episode 300 and then settles at epsilon_min = 0.01). This keeps meaningful exploration for most of the run while still leaving a small amount of random action selection at the end.
 
 ### 4.1 Prioritized Sweeping
 
@@ -211,8 +213,8 @@ The reward comparison trains the full framework on all five rewards. The compone
 The parameter sweep evaluates two parameters:
 
 ```text
-alpha in {0.2, 0.8}
-planning_steps n in {2, 10}
+alpha in {0.2, 0.5, 0.8}
+planning_steps n in {2, 5, 10}
 ```
 
 The sweep is run for Base Environment Reward and Reward 4, so both the base reward and a custom designed reward are evaluated in the sweep section.
@@ -223,40 +225,37 @@ The main metrics are:
 - Normalized environment reward: environment reward scaled relative to the optimal reward for the episode's start state.
 - Success rate: whether the episode ended with successful dropoff.
 - Illegal actions: number of illegal pickup/dropoff actions.
-- Episode length: number of steps taken.
 
 I did not use training reward as a cross-reward comparison metric because the designed rewards have different scales. I also avoided claiming unique-state and mean-TD-error plots in the final report because those metrics are not currently saved in the main result CSV files. The analysis therefore focuses on metrics that are present, reproducible, and comparable across the saved runs.
 
-## 8. Best Policy Visualization
+## 8. Saved Policy Visualization
 
-The project supports Gymnasium's Taxi visualization. Saved policies can be animated without retraining:
+The project supports Gymnasium's Taxi visualization. The clearest live demo across saved seeds and reward designs is:
 
 ```bash
-python main.py --visualize-saved
+python run_trained_model.py
 ```
 
-In addition to the live command, I generated one successful saved-policy animation for each reward design. The GIF files are included in `reports/policy_animations/`:
+In addition to the live command, I generated saved-policy GIFs. These files are included in `reports/policy_animations/`:
 
 ```text
 base_policy.gif
 sparse_policy.gif
 reward_3_policy.gif
-reward_4_policy.gif
+reward_4_regular_attempt.gif
 reward_5_policy.gif
 ```
 
-The GIFs were produced from Gymnasium `render_mode="rgb_array"` frames using saved Q-tables from `results/models`. The following contact sheet shows the final frame from each successful animation:
+The GIFs were produced from Gymnasium `render_mode="rgb_array"` frames using saved Q-tables from `results/models`. By default, `make_policy_gifs.py` renders a regular fixed episode rather than searching for the easiest successful start state.
 
-![Best policy animation contact sheet](reports/policy_animations/policy_animation_contact_sheet.png)
-
-The same policies can also be visualized live with:
+The same saved policies can also be visualized through `main.py`:
 
 ```bash
-python main.py --visualize-saved --visualize-reward base --seed 1
-python main.py --visualize-saved --visualize-reward sparse --seed 1
-python main.py --visualize-saved --visualize-reward reward_3 --seed 1
-python main.py --visualize-saved --visualize-reward reward_4 --seed 1
-python main.py --visualize-saved --visualize-reward reward_5 --seed 1
+python main.py --visualize-saved --visualize-reward base --seed 1 --visualize-candidates 1
+python main.py --visualize-saved --visualize-reward sparse --seed 1 --visualize-candidates 1
+python main.py --visualize-saved --visualize-reward reward_3 --seed 1 --visualize-candidates 1
+python main.py --visualize-saved --visualize-reward reward_4 --seed 1 --visualize-candidates 1
+python main.py --visualize-saved --visualize-reward reward_5 --seed 1 --visualize-candidates 1
 ```
 
 During development, some saved policies succeeded immediately while others entered loops for certain seeds. This is a useful reminder that a single animation is not the whole evaluation. The plots and confidence intervals are needed because Taxi learning is seed-sensitive.
@@ -376,13 +375,13 @@ python main.py --fast
 Visualize saved policies:
 
 ```bash
-python main.py --visualize-saved
+python run_trained_model.py
 ```
 
-Explain one saved episode step by step:
+Regenerate GIFs:
 
 ```bash
-python explain_simulation.py --load-saved --agent full --reward base --seed 1
+python make_policy_gifs.py
 ```
 
 Important files:
@@ -391,6 +390,8 @@ Important files:
 agent.py       - SARSA, prioritized sweeping, kernel generalization
 main.py        - rewards, experiments, plots, model saving, CLI
 visualize.py   - Gymnasium Taxi visualization
+run_trained_model.py - clear saved-policy live demo
+make_policy_gifs.py  - saved-policy GIF generation
 results/       - CSV files, plots, saved models
 reports/       - report artifacts
 ```
@@ -402,8 +403,10 @@ RL_PROJECT/
   agent.py
   main.py
   visualize.py
-  explain_simulation.py
+  run_trained_model.py
+  make_policy_gifs.py
   requirements.txt
+  requirements-dev.txt
   results/
     component_ablation.csv
     reward_comparison.csv
@@ -412,9 +415,8 @@ RL_PROJECT/
     *.png plots
     models/*.npz
   reports/
-    final_report.md
-    final_report.pdf
-    final_report.docx
+    final_report_4_corrected_v6.docx
+    policy_animations/*.gif
 ```
 
 ## 15. Additional Insights
